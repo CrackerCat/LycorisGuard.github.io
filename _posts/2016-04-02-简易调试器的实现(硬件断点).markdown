@@ -1,0 +1,250 @@
+---
+layout: post
+title: 简易调试器的实现(硬件断点)
+date: 2016-04-02 23:12:12 +0900
+category: windowsDebug
+---
+## 一、前言
+　　上篇链接  [简易调试器的实现(一)](https://lycorisguard.github.io/windowsdebug/2016/03/29/%E7%AE%80%E6%98%93%E8%B0%83%E8%AF%95%E5%99%A8%E7%9A%84%E5%AE%9E%E7%8E%B0(%E4%B8%80).html)
+
+　　先说一下上次对于软件断点CC还原的位置，int 3断点，属于陷阱类异常，恢复的地方应该是发生异常指令的下一条指令，但是我们在收到信息的时候FirstChance的时候是下一条，在第二次的时候却是断点发生的地方。最近看了下<软件调试>得到了解释
+
+　　首先写个小程序
+```cpp
+int _tmain(int argc,_TCHAR* argv[])
+{
+  __asm int 3;
+  printf("Hello INT 3");
+  return 0l      
+}
+```
+　　当调试的时候，进入反汇编窗口我们看到发生异常的地址为0x013813CE
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-02/1.png)
+
+　　在查看寄存器窗口，发现EIP为也是0x013813CE
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-02/2.png)
+
+　　在软件调试中得到的答案是
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-02/3.png)
+
+## 二、硬件断点的实现
+　　DRx调试寄存器总共有8个，从DRx0到DRx7。每个寄存器的特性如下
+
+　　1. DR0~DR3：调试地址寄存器，保存需要监视的地址，如设置硬件断点
+
+　　2. DR4~DR5：保留，未公开具体作用
+
+　　3. DR6：调试寄存器组状态寄存器，控制哪个寄存器被命中
+
+　　4. DR7：控制着哪个DRx设置的断点，局部或者全局，读写/执行/写断点类型，断点长度1/2/4/8,的信息
+
+　　其中DR6和DR7每位的意义如下：
+
+```cpp
+typedef struct _DBG_REG6
+{
+    /*
+    //     断点命中标志位，如果位于DR0~3的某个断点被命中，则进行异常处理前，对应
+    // 的B0~3就会被置为1。
+    */
+    unsigned B0 : 1;  // Dr0断点触发置位
+    unsigned B1 : 1;  // Dr1断点触发置位
+    unsigned B2 : 1;  // Dr2断点触发置位
+    unsigned B3 : 1;  // Dr3断点触发置位
+    /*
+    // 保留字段
+    */
+    unsigned Reserve1 : 9;
+    /*
+    // 其它状态字段
+    */
+    unsigned BD : 1;  // 调制寄存器本身触发断点后，此位被置为1
+    unsigned BS : 1;  // 单步异常被触发，需要与寄存器EFLAGS的TF联合使用
+    unsigned BT : 1;  // 此位与TSS的T标志联合使用，用于接收CPU任务切换异常
+    /*
+    // 保留字段
+    */
+    unsigned Reserve2 : 16;
+}DBG_REG6,*PDBG_REG6;
+
+typedef struct _DBG_REG7
+{
+    /*
+    // 局部断点(L0~3)与全局断点(G0~3)的标记位
+    */
+    unsigned L0 : 1;  // 对Dr0保存的地址启用 局部断点
+    unsigned G0 : 1;  // 对Dr0保存的地址启用 全局断点
+    unsigned L1 : 1;  // 对Dr1保存的地址启用 局部断点
+    unsigned G1 : 1;  // 对Dr1保存的地址启用 全局断点
+    unsigned L2 : 1;  // 对Dr2保存的地址启用 局部断点
+    unsigned G2 : 1;  // 对Dr2保存的地址启用 全局断点
+    unsigned L3 : 1;  // 对Dr3保存的地址启用 局部断点
+    unsigned G3 : 1;  // 对Dr3保存的地址启用 全局断点
+    /*
+    // 【以弃用】用于降低CPU频率，以方便准确检测断点异常
+    */
+    unsigned LE : 1;
+    unsigned GE : 1;
+    /*
+    // 保留字段
+    */
+    unsigned Reserve1 : 3;
+    /*
+    // 保护调试寄存器标志位，如果此位为1，则有指令修改条是寄存器时会触发异常
+    */
+    unsigned GD : 1;
+    /*
+    // 保留字段
+    */
+    unsigned Reserve2 : 2;
+    /*
+    // 保存Dr0~Dr3地址所指向位置的断点类型(RW0~3)与断点长度(LEN0~3)，状态描述如下：
+    */
+    unsigned RW0 : 2;  // 设定Dr0指向地址的断点类型
+    unsigned LEN0 : 2;  // 设定Dr0指向地址的断点长度
+    unsigned RW1 : 2;  // 设定Dr1指向地址的断点类型
+    unsigned LEN1 : 2;  // 设定Dr1指向地址的断点长度
+    unsigned RW2 : 2;  // 设定Dr2指向地址的断点类型
+    unsigned LEN2 : 2;  // 设定Dr2指向地址的断点长度
+    unsigned RW3 : 2;  // 设定Dr3指向地址的断点类型
+    unsigned LEN3 : 2;  // 设定Dr3指向地址的断点长度
+}DBG_REG7,*PDBG_REG7;
+```
+　　知道了Dr7的各个位的意义，我们就能设置硬件断点了。
+
+　　首先通过GetThreadContext获得Dr7的值，在通过SetThreadContext来设置Dr7的值。
+
+```cpp
+HANDLE SetHardwareBreakpoint(HANDLE hThread,HWBRK_TYPE Type,HWBRK_SIZE Size,void* s)
+{    
+
+    if(m_vecHard.size( ) > 3) 
+        return FALSE;
+
+    PointInfo bkpt;
+    bkpt.lpPointAddr = (DWORD)s; //记录断点地址
+    bkpt.ptType = DR_POINT; //记录断点类型
+
+    int j = 0;
+    int y = 0;
+    CONTEXT ct = {0};
+    int iReg = 0;
+
+    j =SuspendThread(g_hThread);   //这里我遇到一个坎一直过不去
+     //这里总是无效句柄，
+    y = GetLastError();
+
+    ct.ContextFlags = CONTEXT_DEBUG_REGISTERS|CONTEXT_FULL;
+    if(!GetThreadContext(hThread,&ct))
+    {
+        y = GetLastError();
+        MessageBox(NULL,L"Fail",L"1",1);
+    }
+    int FlagBit = 0;
+
+    bool Dr0Busy = false;
+    bool Dr1Busy = false;
+    bool Dr2Busy = false;
+    bool Dr3Busy = false;
+    if (ct.Dr7 & 1) //0位  0 local
+        Dr0Busy = true;
+    if (ct.Dr7 & 4) //2位  1 local
+        Dr1Busy = true;
+    if (ct.Dr7 & 16)//4位  2 local
+        Dr2Busy = true;
+    if (ct.Dr7 & 64)//6位  3 local
+        Dr3Busy = true;
+    
+    
+        if (!Dr0Busy)
+        {  bkpt.Number = 0;
+            iReg = 0;
+            ct.Dr0 = (DWORD_PTR)s;  //地址
+            Dr0Busy = true; 
+        }
+        else
+            if (!Dr1Busy)
+            {
+                 bkpt.Number = 1;
+                iReg = 1;
+                ct.Dr1 = (DWORD_PTR)s;
+                Dr1Busy = true;
+            }
+            else
+                if (!Dr2Busy)
+                { bkpt.Number= 2;
+                    iReg = 2;
+                    ct.Dr2 = (DWORD_PTR)s;
+                    Dr2Busy = true;
+                }
+                else
+                    if (!Dr3Busy)
+                    {
+                        bkpt.Number = 3;
+                        iReg = 3;
+                        ct.Dr3 = (DWORD_PTR)s;
+                        Dr3Busy = true;
+                    }
+                    else
+                    {
+                        //h->SUCC = false;
+                        j = ResumeThread(hThread);
+                        y = GetLastError();
+                        return 0;
+                    }
+    ct.Dr6 = 0;
+    int st = 0;
+    if (Type == HWBRK_TYPE_CODE)
+               st = 0;
+    if (Type == HWBRK_TYPE_READWRITE)
+        st = 3;
+    if (Type == HWBRK_TYPE_WRITE)
+        st = 1;
+    int le = 0;
+    if (Size == HWBRK_SIZE_1)
+        le = 0;
+    if (Size == HWBRK_SIZE_2)
+        le = 1;
+    if (Size == HWBRK_SIZE_4)
+        le = 3;
+    if (Size == HWBRK_SIZE_8)
+        le = 2;
+
+    SetBits(ct.Dr7, 16 + iReg*4, 2, st);
+    SetBits(ct.Dr7, 18 + iReg*4, 2, le);
+    SetBits(ct.Dr7, iReg*2,1,1);
+    
+
+
+
+    ct.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if(!SetThreadContext(hThread,&ct))
+    {
+        y = GetLastError();
+        MessageBox(NULL,L"Fail",L"1",1);
+    }
+
+
+    ct.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if(!GetThreadContext(hThread,&ct))
+    {
+        y = GetLastError();
+        MessageBox(NULL,L"Fail",L"1",1);
+    }
+
+    j = ResumeThread(hThread);
+
+    y = GetLastError();
+    
+    m_vecHard.push_back(bkpt);
+    return 0;
+}
+
+
+void SetBits(DWORD_PTR& dw, int lowBit, int bits, int newValue)
+{
+    DWORD_PTR mask = (1 << bits) - 1; 
+    dw = (dw & ~(mask << lowBit)) | (newValue << lowBit);
+}
+```
+　　在GetThreadContext之前一定要挂起线程，SuspendThread，不然可能context在获得的时候线程的堆栈正发生变化，那么结构也不能准确。

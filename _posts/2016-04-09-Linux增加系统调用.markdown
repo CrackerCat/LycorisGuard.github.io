@@ -1,0 +1,129 @@
+---
+layout: post
+title: Linux增加系统调用
+date: 2016-04-09 15:10:12 +0900
+category: Linux
+---
+使用Ubuntu14.04，内核从3.19.0替换成3.19.2，成功添加系统调用
+
+### 一、www.kernel.org上下载内核，我下载的版本是3.19.2，并解压到/usr/src/目录
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/1.png)
+
+超级管理员权限
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/2.png)
+
+将内核源码拷贝到 /usr/src 目录，mv是移动指令，cp是拷贝指令
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/3.png)
+
+将内核文件解压缩
+
+tar -xvf file.tar 解压tar.gz
+
+tar -xzvf file.tar.gz解压tar.gz
+
+unrar e file.rar 解压rar
+
+tar -xZvf file.tar.Z 解压tar.Z
+
+tar -xjvf file.tar.bz2 解压tar.bz2
+
+unzip file.zip 解压zip
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/4.png)
+
+### 二、在下载的内核中增加自己的系统调用。
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/5.png)
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/6.png)
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/7.png)
+
+在头文件中，申明我们的系统调用函数
+
+![8](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/8.png)
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/9.png)
+
+实现我们的系统调用函数
+
+![10](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/10.png)
+
+![11](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/11.png)
+
+创建Kconfig.mycall文件
+
+![12](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/12.png)
+
+打开makefile文件，将mycall.o加入obj-y中，这样编译的时候就能找到我们增加的mycall.c文件
+
+![13](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/13.png)
+
+另外我们可以直接在sys.c中实现我们的函数，就不需要创建文件以及在obj-y中添加编译项，但不能有两个函数体，不然编译报错
+
+![14](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/14.png)
+
+打开源码路径下的makefile文件，将extraversion后面加载.syscall，这就是之后我们的内核名字
+
+![15](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/15.png)
+
+生成配置文件
+
+![16](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/16.png)
+
+### 三、编译内核
+make指令，这个要很长时间
+
+![17](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/17.png)
+
+安装模块
+
+![18](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/18.png)
+
+安装内核
+
+![19](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/19.png)
+
+安装之后，在/boot/路径下我们可以看到多出了几个文件
+
+![20](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/20.png)
+
+![21](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/21.png)
+
+按住shift，选择高级选项
+
+![22](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/22.png)
+
+选择我们刚才安装的内核
+
+![23](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/23.png)
+
+重启查看内核已经更换
+
+![24](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/24.png)
+
+我们新增加的函数，以及增加
+
+![25](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/25.png)
+
+### 四、编译运行
+
+在桌面创建一个.c文件，利用syscall调用我们添加的系统调用，第一个参数是调用号，我们自己定义的323，第二个参数是自己随意输入的数字100的参数
+
+![26](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/26.png)
+
+编译运行，新增加的系统调用函数执行成功
+
+![27](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/27.png)
+
+![28](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/28.png)
+
+再看看内核中的调试输出，dmesg 为检测和内核缓冲区，-c为打印后清除
+
+![29](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/29.png)
+
+注意：编译内核的时候不要重复执行make指令，否则可能文件夹会特别大
+
+![30](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-09/30.png)

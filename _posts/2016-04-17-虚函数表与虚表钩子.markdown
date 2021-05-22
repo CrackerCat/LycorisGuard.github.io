@@ -1,0 +1,584 @@
+---
+layout: post
+title: 虚函数表与虚表钩子
+date: 2016-04-17 12:59:12 +0900
+category: C++
+---
+## 0x01、前言
+　　对C++ 了解的人都应该知道虚函数（Virtual Function）是通过一张虚函数表（Virtual Table）来实现的。简称为V-Table。在这个表中，主是要一个类的虚函数的地址表，这张表解决了继承、覆盖的问题，保证其容真实反应实际的函数。这样，在有虚函数的类的实例中这个表被分配在了这个实例的内存中，所以，当我们用父类的指针来操作一个子类的时候，这张虚函数表就显得由为重要了，它就像一个地图一样，指明了实际所应该调用的函数。
+
+　　这里我们着重看一下这张虚函数表。C++的编译器应该是保证虚函数表的指针存在于对象实例中最前面的位置（这是为了保证取到虚函数表的有最高的性能——如果有多层继承或是多重继承的情况下）。 这意味着我们通过对象实例的地址得到这张虚函数表，然后就可以遍历其中函数指针，并调用相应的函数。
+ 
+
+## 0x02、实例分析
+
+　　 我们假设有这么一个类,有三个虚函数
+```cpp
+class Base1 {
+public:
+　 virtual void f() { cout << "Base::f" << endl; }
+   virtual void g() { cout << "Base::g" << endl; }
+   virtual void h() { cout << "Base::h" << endl; }
+};
+```
+　　我们生成类的实例去遍历这个虚表的方式也很简单
+```cpp
+  typedef void(*Fun)(void);
+
+    Base b;
+    Fun pFun = NULL;
+ 
+    // cout << "虚函数指针的地址：" << (int*)(&b) << endl;  解两次&b保存着指向虚表的指针
+    cout << "虚函数表地址：" << (int*)*(int*)(&b) << endl;
+
+    pFun = (Fun)*((int*)*(int*)(&b)+0);  // Base::f()
+ 　 pFun();
+    pFun = (Fun)*((int*)*(int*)(&b)+1);  // Base::g()
+　　 pFun();
+    pFun = (Fun)*((int*)*(int*)(&b)+2);  // Base::h()    
+ 　 pFun();
+```
+　　而结果也是很明显的
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/1.png)
+
+　　而虚函数的存储位置我们可以通过这张图来了解
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/2.png)
+
+　　&b就是虚函数表的地址，按声明顺序保存着虚函数的地址。最后一个点表示结束，对于不同编译器这个值是不同的。
+
+　　我们看看虚表的内存
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/3.png)
+
+　　我们可以看到前12个字节分别保存着0030104b、00301186、0030122b就是我们上图调用函数的地址，就是声明的虚函数地址，而后面则是保存着我们函数输出的字符串。
+
+　　我们试试64位下
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/4.png)
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/5.png)
+
+　　我们可以看到只是地址变成8字节了，我们把上面的int变成DWORD64就行，虚表中保存的地址为8字节。
+
+　　我们分为以下4种继承情况分析虚表
+
+### 1.一般继承（无虚函数覆盖）
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/6.png)
+
+　　我们的子类对父类的虚函数不加以实现，子类加入自己的虚函数
+
+```cpp
+class Derive1:public Base1
+{
+public:
+    virtual void f1() { cout << "Derive::f1" << endl; }
+    virtual void g1() { cout << "Derive::g1" << endl; }
+    virtual void h1() { cout << "Derive::h1" << endl; }
+};
+```
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/7.png)
+
+　　那我们的虚函数表就变成这样了，子类实现的虚函数会放在父类虚函数表后面
+
+![8](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/8.png)
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/9.png)
+
+### 2.一般继承（有虚函数覆盖）
+```cpp
+class Son1:public Base1
+{
+public:
+    void f() { cout << "Son::f" << endl; }          //对父类的实现
+    virtual void g1() { cout << "Son::g1" << endl; }
+    virtual void h1() { cout << "Son::h1" << endl; }
+
+};
+```
+
+![10](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/10.png)
+
+　　当我们的子类对父类中虚函数覆盖时，我们子类中实现的函数地址就会覆盖虚函数表中父类原来虚函数的地址
+
+![11](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/11.png)
+
+　　这里就实现了多态
+
+![12](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/12.png)
+
+![13](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/13.png)
+
+### 3.多重继承（无虚函数覆盖）
+```cpp
+class Derive : public Base1, public Base2, public Base3 
+{
+public:
+    virtual void f1() { cout << "Derive::f1" << endl; }
+    virtual void g1() { cout << "Derive::g1" << endl; }
+};
+```
+
+![14](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/14.png)
+
+　　在子类的虚函数表是下面这样的
+
+![15](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/15.png)
+
+　　我们遍历这个虚表
+```cpp
+    Derive d;
+    int** pVtab = (int**)&d;
+
+    //Base1's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+0);
+    pFun = (Fun)pVtab[0][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+1);
+    pFun = (Fun)pVtab[0][1];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+2);
+    pFun = (Fun)pVtab[0][2];
+    pFun();
+
+    //Derive's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+3);
+    pFun = (Fun)pVtab[0][3];
+    pFun();
+
+    
+    pFun = (Fun)pVtab[0][4];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[0][5];
+    cout<<pFun<<endl;
+
+
+    //Base2's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);
+    pFun = (Fun)pVtab[1][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);
+    pFun = (Fun)pVtab[1][1];
+    pFun();
+
+    pFun = (Fun)pVtab[1][2];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[1][3];
+    cout<<pFun<<endl;
+
+
+
+    //Base3's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);
+    pFun = (Fun)pVtab[2][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);
+    pFun = (Fun)pVtab[2][1];
+    pFun();
+
+    pFun = (Fun)pVtab[2][2];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[2][3];
+    cout<<pFun<<endl;
+```
+　　得到遍历的结果
+
+![16](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/16.png)
+
+ 　　我们&d的地址
+
+![17](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/17.png)
+
+　　可以看到有三个地址，分别对应着三个虚函数表
+
+　　我们的实现中，第一个地址保存着第一个父类Base1中的三个虚函数，还有自己实现的两个虚函数，一共是5个，第六个2d6e7552截止。
+
+![18](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/18.png)
+
+　　第二个地址003f7848和第三个地址003f7834分别对应着Base2，Base3的虚函数表
+
+### 4.多重继承（有虚函数覆盖）
+```cpp
+class Derive : public Base1, public Base2, public Base3 
+{
+public:
+    void f1() { cout << "Derive::f" << endl; }
+    virtual void g1() { cout << "Derive::g1" << endl; }
+};
+```
+![19](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/19.png)
+
+![20](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/20.png)
+
+　　我们可以看到，对于三个虚函数表，子类的实现将其都覆盖了 ，继续用上面那个例子遍历，不过子类的虚函数实现只有一个所以pFun = (Fun)pVtab[0][4];就是虚函数表中的结束的地址，不能在遍历，不然会崩溃
+
+![21](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-17/21.png)
+
+　　可以看到三个虚表中的第一个成员都被子类实现，并且都更新到虚表中。
+
+　　下面是完整测试代码
+
+```cpp
+// VirtualTable.cpp : 定义控制台应用程序的入口点。
+//
+
+#include "stdafx.h"
+
+#include <iostream>
+using namespace std;
+#include <Windows.h>
+
+class Base1 {
+public:
+    virtual void f() { cout << "Base1::f" << endl; }
+    virtual void g() { cout << "Base1::g" << endl; }
+    virtual void h() { cout << "Base1::h" << endl; }
+
+};
+
+class Base2 {
+public:
+    virtual void f() { cout << "Base2::f" << endl; }
+    virtual void g() { cout << "Base2::g" << endl; }
+    virtual void h() { cout << "Base2::h" << endl; }
+};
+
+class Base3 {
+public:
+    virtual void f() { cout << "Base3::f" << endl; }
+    virtual void g() { cout << "Base3::g" << endl; }
+    virtual void h() { cout << "Base3::h" << endl; }
+};
+
+
+class Derive : public Base1, public Base2, public Base3 
+{
+public:
+    void f() { cout << "Derive::f" << endl; }
+    virtual void g1() { cout << "Derive::g1" << endl; }
+};
+class Son:public Base1
+{
+public:
+    virtual void f1() { cout << "Son::f1" << endl; }
+    virtual void g1() { cout << "Son::g1" << endl; }
+    virtual void h1() { cout << "Son::h1" << endl; }
+
+};
+class Son1:public Base1
+{
+public:
+    void f() { cout << "Son::f" << endl; }
+    virtual void g1() { cout << "Son::g1" << endl; }
+    virtual void h1() { cout << "Son::h1" << endl; }
+
+};
+
+typedef void(*Fun)(void);
+
+int main()
+{
+    Fun pFun = NULL;
+    /*
+    //遍历父类虚函数表
+    Base1 b;
+    //cout << "虚函数表地址：" << (int*)(&b) << endl;
+    cout << "虚函数表地址:" << (DWORD64*)*(DWORD64*)(&b) << endl;
+
+    pFun = (Fun)*((DWORD64*)*(DWORD64*)(&b)+0);  // Base::f()
+    cout<<"Base f Address:"<<pFun<<endl;
+    pFun();
+    pFun =(Fun)*((DWORD64*)*(DWORD64*)(&b)+1);  // Base::g()
+    cout<<"Base g Address:"<<pFun<<endl;
+    pFun();
+    pFun =(Fun)*((DWORD64*)*(DWORD64*)(&b)+2);  // Base::h()   
+    cout<<"Base h Address:"<<pFun<<endl;
+    pFun();
+    */
+    /*
+    //一般继承 无覆盖
+    //遍历子类虚函数表
+    Son son;
+    cout<<"子类虚函数表地址: "<<(int*)*(int*)&(son)<<endl;
+    pFun  = (Fun)*((int*)*(int*)&(son)+0);
+    cout<<"Base f Address:"<<pFun<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+1);
+    cout<<"Base g Address:"<<pFun<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+2);
+    cout<<"Base h Address:"<<pFun<<endl;
+    pFun();
+
+    pFun  = (Fun)*((int*)*(int*)&(son)+3);
+    cout<<"son f Address:"<<pFun<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+4);
+    cout<<"son g Address:"<<pFun<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+5);
+    cout<<"son h Address:"<<pFun<<endl;
+    pFun();
+    */
+    /*
+    一般继承  实现覆盖
+    Son1 son;
+    cout<<"子类虚函数表地址: "<<(int*)*(int*)&(son)<<endl;
+    pFun  = (Fun)*((int*)*(int*)&(son)+0);
+    cout<<"son f Address:"<<pFun<<"我覆盖了啦啦啦"<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+1);
+    cout<<"Base g Address:"<<pFun<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+2);
+    cout<<"Base h Address:"<<pFun<<endl;
+    pFun();
+
+    pFun  = (Fun)*((int*)*(int*)&(son)+3);
+    cout<<"son g Address:"<<pFun<<endl;
+    pFun();
+    pFun  = (Fun)*((int*)*(int*)&(son)+4);
+    cout<<"son h Address:"<<pFun<<endl;
+    pFun();
+    */
+
+    /*多重继承   无覆盖
+    Derive d;
+    int** pVtab = (int**)&d;
+
+    //Base1's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+0);
+    pFun = (Fun)pVtab[0][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+1);
+    pFun = (Fun)pVtab[0][1];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+2);
+    pFun = (Fun)pVtab[0][2];
+    pFun();
+
+    //Derive's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+3);
+    pFun = (Fun)pVtab[0][3];
+    pFun();
+
+    
+    pFun = (Fun)pVtab[0][4];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[0][5];
+    cout<<pFun<<endl;
+
+
+    //Base2's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);
+    pFun = (Fun)pVtab[1][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);
+    pFun = (Fun)pVtab[1][1];
+    pFun();
+
+    pFun = (Fun)pVtab[1][2];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[1][3];
+    cout<<pFun<<endl;
+
+
+
+    //Base3's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);
+    pFun = (Fun)pVtab[2][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);
+    pFun = (Fun)pVtab[2][1];
+    pFun();
+
+    pFun = (Fun)pVtab[2][2];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[2][3];
+    cout<<pFun<<endl;
+    */
+
+
+    /*多重继承   有覆盖*/
+    Derive d;
+    int** pVtab = (int**)&d;
+
+    //Base1's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+0);
+    pFun = (Fun)pVtab[0][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+1);
+    pFun = (Fun)pVtab[0][1];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+2);
+    pFun = (Fun)pVtab[0][2];
+    pFun();
+
+    //Derive's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+0)+3);
+    pFun = (Fun)pVtab[0][3];
+    pFun();
+
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[0][4];
+    cout<<pFun<<endl;
+
+
+    //Base2's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);
+    pFun = (Fun)pVtab[1][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);
+    pFun = (Fun)pVtab[1][1];
+    pFun();
+
+    pFun = (Fun)pVtab[1][2];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[1][3];
+    cout<<pFun<<endl;
+
+
+
+    //Base3's vtable
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+0);
+    pFun = (Fun)pVtab[2][0];
+    pFun();
+
+    //pFun = (Fun)*((int*)*(int*)((int*)&d+1)+1);
+    pFun = (Fun)pVtab[2][1];
+    pFun();
+
+    pFun = (Fun)pVtab[2][2];
+    pFun();
+
+    //The tail of the vtable
+    pFun = (Fun)pVtab[2][3];
+    cout<<pFun<<endl;
+    
+    return 0;
+}
+```
+　　参考：[http://blog.csdn.net/haoel/article/details/1948051/](http://blog.csdn.net/haoel/article/details/1948051/)
+
+## 0x03、简单虚表钩子
+　　我们知道虚函数表了，那么我们有种Hook叫做虚表钩子，替换对象中虚表的函数地址，走进我们的函数，然后在实现完成之后调用原来函数
+
+　　代码如下
+```cpp
+// COMHook.cpp : 定义控制台应用程序的入口点。
+//
+
+#include "stdafx.h"
+#include <iostream>
+using namespace std;
+#include <windows.h>
+
+typedef void(*Fun)(void);
+Fun FuncAddres;
+class A
+{
+public:
+    int a ;
+    int b ;
+    A(){}
+    ~A(){}
+
+    virtual void f1(){ printf("Founction f1 called\n"); }
+
+    virtual void f2(){ printf("Founction f2 called\n"); }
+
+    virtual void f3(){ printf("Founction f3 called\n"); }
+private:
+    int n;
+}; 
+class B :public A
+{
+public:
+    void f1();
+    void f2();
+    void f3();
+};
+void B::f1()
+{
+    printf("Hello f1\r\n");
+}
+void B::f2()
+{
+    printf("Hello f2\r\n");
+}
+void B::f3()
+{
+    printf("Hello f3\r\n");
+}
+
+
+
+void myfunc()
+{
+    cout<<"我是大坏蛋"<<endl;
+    FuncAddres();
+}
+int _tmain(int argc, _TCHAR* argv[])
+{
+    
+    B* b = new B;
+    
+    long** pplVrtable= (long**)(b);    //取得虚函数表的指针
+    cout<<"My Func Address : "<<myfunc<<endl;
+
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, ::GetCurrentProcessId());
+    MEMORY_BASIC_INFORMATION mbi = {0};
+    if (VirtualQueryEx(hProcess, (LPVOID)(*pplVrtable), &mbi, sizeof(mbi)) != sizeof(mbi))
+        return 0;
+
+    DWORD dwOldProtect = 0;
+    if(!::VirtualProtectEx(hProcess, mbi.BaseAddress, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect)) 
+        return 0;
+
+    FuncAddres = (Fun)*(int*)*pplVrtable;//保存原来的函数地址
+    *(int*)*pplVrtable =(long)myfunc;//(LONG)pplVrtable[0][1];//将虚函数表的指针指向虚函数表第二个值。
+
+
+
+    DWORD dwTemp = 0;
+    ::VirtualProtectEx(hProcess, mbi.BaseAddress, 4, dwOldProtect, &dwTemp);
+    CloseHandle(hProcess);
+
+    b->f1();
+    b->f2();
+    b->f3();
+
+    delete b;
+    return 0;
+}
+```
+ 　　需要注意的是在测试的时候 B b;这样申明之后，虽然改了内存中虚表地址，但是不会调用我们的myfunc函数。只有B*b = new B;这样生成替换之后才能走进我们的myfunc函数。

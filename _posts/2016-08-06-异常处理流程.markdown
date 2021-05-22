@@ -1,0 +1,33 @@
+---
+layout: post
+title: 异常处理流程
+date: 2016-08-06 17:39:12 +0900
+category: windowsDebug
+---
+
+　　对于CPU级的异常，CPU会通过IDT表寻找异常的处理函数，也就是KiTrapXX例程，会调用CommonDispatchException准备参数，然后调用内核分发函数KiDispatchException进行异常分发。
+
+　　下面的图是内核异常分发总管KiDispatchException处理的流程。
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-06/1.png)
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-06/2.png)
+
+### 一、内核态异常的分发过程：
+
+　　1.如果PreviousMode为KernelMode(0)，那么对于第一轮处理机会，KiDispatchException会试图先通知内核调试器来处理该异常。
+
+　　2.内核变量KiDebugRoutine用来标识内核调试引擎交互的接口函数。当内核调试引擎启用时，KiDebugRoutine指向内核调试引擎KdpTrap，这个函数会进一步把异常信息封装为数据包发送给内核调试器，当调试内核调试引擎没有启用时，KiDebugRoutine指向KdpStub函数，简单处理后返回
+
+　　3.如果KiDebugRoutine返回TRUE，也就是内核引擎处理了异常，那么KiDispatchException便停止继续分发，准备返回。如果KiDebugRoutine返回FALSE，也就是没有处理该异常，那么KiDispatchException会调用RtlDispatchException函数，试图寻找已经注册的结构化异常处理器(SEH)。会遍历异常登记链表，依次执行每个异常处理器。如果某个处理器除了了，RtlDispatchException返回TRUE，否则返回FALSE
+
+　　4.RtlDispatchException返回FALSE，KiDispatchException会试图给内核调试器第二次机会，如果KiDebugRoutine仍然返回FALSE，那么KiDispatchException会认为这是无人处理的异常，会调用KeBugCheckEx
+
+
+### 二、用户态异常的分发过程：
+
+　　1.如果前一模式是用户模式，即PreviousMode参数等于UserMode(1),对于第一次处理机会，KiDispatchException会试图将异常分发给用户态的调试器，如果DebugPort不为空，将异常发送给调试子系统，调试子系统将异常发送给调试器，如果处理了异常分发结束。
+
+　　2.如果调试器没有处理该异常，KiDispatchException修改用户态栈，返回用户层之后执行KiUserExceptionDispatcher，此函数会调用RtlDispatchException来寻找异常处理器，首先遍历VEH，然后遍历SEH，。如果RtlDispatchException返回FALSE，并且当前进程在被调试，那么KiUserExceptionDispatcher会调用ZwRaiseException并将FirstChance设置为FALSE，进行第二轮分发。如果没有被调试，结束进程。
+
+　　3.ZwRaiseException会通过内核服务NtRaiseException把异常传递给KiDispatchException来进行分发。第二次，将异常传递给调试器，如果没有处理将异常分配给ExceptionPort异常端口监听者处理，如果返回FALSE，结束进程。

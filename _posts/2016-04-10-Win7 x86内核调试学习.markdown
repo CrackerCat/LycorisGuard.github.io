@@ -1,0 +1,354 @@
+---
+layout: post
+title: Win7 x86内核调试学习
+date: 2016-04-10 18:28:12 +0900
+category: windowsDebug
+---
+参考  [这两天对某P双机调试的学习及成果](https://bbs.pediy.com/thread-196149.htm) ，非常好的一篇分析贴。
+
+本文在Win7 x86下的分析，在虚拟机中以/DEBUG模式启动TP游戏，系统会自动重启。
+
+ 
+
+## 0x01 内核调试全局变量 
+
+根据软件调试第十八章，windows启动过程中会调用两次KdInitSystem()函数
+
+第一次调用KdInitSystem分别会初始化如下变量
+
+1.KdPitchDebugger : Boolean 用来表示是否显示的抑制内核调试， 当启动项中包含 /NODEBUG选项时，这个变量会被置为 TRUE
+
+2.KdDebuggerEnabled : Boolean 用来表示内核调试是否被启用。当启动项中包含 /DEBUG 或者/ DEBUGPORT 而且不包含/NODEBUG时，这个 变量置为TRUE
+
+3.kiDebugRoutine : 函数指针类型 ，用来记录内核调试引擎的异常处理回调函数，当内核调试引擎活动时，指向KdpTrap函数，否则指向 KdpStub函数
+
+4.KdpBreakpointTable : 结构体数组类型，用来记录代码断点。每一个元素为BREAKPOINT_ENTRY结构，用来描述一个断点，包括断点地 址。
+
+5.KdDebuggerNotPresent也是判断内核调试状态的标志(收到复位包之后，将KdDebuggerNotPresent设置为0)
+
+6.KdEnteredDebugger，在内核冻结时，会对KdEnterDebugger赋值，TP就是根据这个点进行MDL判断。详细可以参考 [某驱动的内核调试检测学习内核调试引擎加载机制](https://bbs.pediy.com/thread-186091.htm)
+
+ 
+
+
+
+当启用/debug模式的时候
+
+     KdPitchDebugger = FALSE;
+
+     KdDebuggerEnabled = TRUE;
+
+     KiDebugRoutine -> KdpTrap　　
+
+windbg中我们查看这几个变量
+
+kd> dd KdPitchDebugger             =>是否抑制内核调试
+
+83f7fd27 00000300 00003c00 fe796000 ffffffff
+
+kd> dd KdDebuggerEnabled         => 内核调试启用时为1
+
+83fbbd2c 00000001 00000000 00000000 db1dbbbb
+
+kd> dd KiDebugRoutine                => 内核引擎活动时指向KdpTrap ，否则指向KdpStub
+
+83fc09bc 841834f2 83ed4d9c 00000000 00000191
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/1.png)
+
+先将KdPitchDebugger 置为1 表示抑制内核调试
+
+kd> ed KdPitchDebugger 1
+
+kd> dd KdPitchDebugger
+
+83f7fd27 00000001 00003c00 fe796000 ffffffff
+
+然后设置KiDebugRoutine 指向的指针 从KdpTrap 改成 KdpStub
+
+kd> dd KiDebugRoutine
+
+83fc09bc 841834f2 83ed4d9c 00000000 00000191
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/2.png)
+
+kd> ed KiDebugRoutine 83f339af
+
+kd> dd KiDebugRoutine
+
+83fc09bc 83f339af 83ed4d9c 00000000 00000191
+
+
+最后恢复KdDebuggerEnabled 为 0，之所以最后设置，因为设置这个之后windbg就接受不到调试消息包了 表示内核调试未启用
+
+kd> ed KdDebuggerEnabled 0
+
+这样windbg就收不到消息包了。
+
+
+在设置这几项之后，在启动游戏
+
+还是重启，很显然检测内核引擎不仅仅是靠读取这几个值
+
+
+## 0x02 Windows内核调试函数
+windows启动内核调试后，主要做了以下几个工作
+
+1.建立连接
+
+2.调试器读取目标系统信息，初始化调试引擎
+
+3.内核调试引擎通过状态变化信息包通知调试器加载初始模块的调试符号
+
+4.调试器端发送中断包，将目标系统中断到调试器，交互调试后又恢复执行的过程
+
+5.因断点命中，目标系统中断到调试器的过程
+
+6.内核中的模块输出调试字符串(DbgPrint)到调试器
+
+
+
+ 
+
+内核调试几个关键函数
+
+1.KdEnterDebugger
+用于冻结内核，调试后首先会禁止中断，对于多处理器的系统，它会将当前CPU的IRQL升高到HIGH_LEVEL并冻结所有的其他的CPU，锁定调试器的通信端口，调用KdSave()让通信模块保存通信状态，并将全局变量KdEnteredDebugger设置为真，当KdEnterDebugger执行后，整个系统进入一种简单任务状态，当前的CPU只执行当前的线程，其他CPU出于冻结状态。
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/3.png)
+
+2.KdExitDebugger恢复内核运行，主要工作有调用KdRestore让通信扩展模块恢复通信状态，对锁定的通信端口解锁。调用KeThawExecution来恢复系统进入正常的运行状态，包括恢复中断，降低当前CPU的IRQL，对多CPU系统，恢复其他CPU。
+
+3.KdpReportExceptionStateChange CPU报告异常类状态变化
+
+4.KdpReportLoadSymbolsStateChange CPU报告符号加载类异常
+
+5.KdpSendWaitContinue函数用来发送信息堡，与调试器对话
+
+6.KeUpdateSystemTime 函数在每次更新系统时间时会检查全局变量KdDebuggerEnabled来判断内核调试引擎是否被启用，如果为真则调用KdUpdateRunTime，KeUpdateRun检测KdDebuggerEnabled，并且调用KdCheckForDebugger检测KdDebuggerEnabled和KdPitchDebugger并且调用KdPollBreakIn函数来查看调试器是否发送了中断命令，如果是，则调用DbgBreakPointWithStatus触发断点异常，中断到调试器。
+
+7.KdpTrap来处理内核态的异常，当内核态发生异常时，KiDispatchException函数会调用全局变量KiDebugRoutine所指向的函数，当调试引擎启用时，这个变量的值是KdpTrap函数的地址，所以一旦异常发生时，系统就会调用KdpTrap。KdpTrap函数调用KdpReport向调试器报告异常。
+
+8.KiSaveProcessorControlState 保存cpu的控制状态
+
+9.KiRestoreProcessorControlState恢复CPU状态
+
+10.DbgPrint、DbgPrintEx、vDbbggPrintEx打印调试信息
+
+这里我们要注意的是 当收到复位包的时候 清0 KdDebuggerNotPresent 冻结内核的时候 KdEnteredDebugger 会赋值KdEnteredDebugger = TRUE
+
+TP对于KdEnteredDebugger值用MDL映射，判断是否为真，如果为真则直接重启，我们选择Hook IoCreateMdl函数来过滤
+
+## 0x03 解决内核调试
+根据上面的几点，我们要解决的事情有
+
+1.KdDebuggerEnabled 表示开启了调试， 我们要置为0
+
+2.KdDebuggerEnabled置为0之后windbg就收不到消息了，这里我们要知道windbg怎么收到消息的
+
+3.TP对于KdEnterDebugger的检测，这里用Hook IoAllocateMdl解决
+
+4.TP会将kiDebugRoutine指向的地方，变成KdpStub，我们可以Hook KdpStub，跳转到KdpTrap，也可以在调试的时候修改其内容
+
+5.TP调用KiDisableDebugger对于KdDebuggerEnabled清0，我们可以Hook KiDisableDebugger让其直接返回
+
+ 
+
+### 一、我们首先看一下Windbg怎么收到消息的
+
+ctrl+break断下来之后，输入kn，我们可以看到这几个函数的调用 
+
+KeUpdateSystemTimeAssist -> KeUpdateSystemTime -> KeUpdateRunTime -> KdCheckForDebugBreak -> RtlpBreakWithStatusInstruction -> 通过int 3  断下来
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/4.png)
+
+我们通过IDA查看这几个函数对于KiDebuggerEnabled和KdPitchDebugger的检测
+
+1.在KeUpdateSystemTime中，对于KdDebuggerEnabled标志位的检测
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/5.png)
+
+2.在KeUpdateSystemTime中调用KeUpdateRunTime函数，检测KdDebuggerEnabled标志
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/6.png)
+
+3.然后继续反汇编KdCheckForDebugBreak函数,可以看到最KdDebuggerEnabled和 KdPitchDebugger的检测
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/7.png)
+
+4.可以看到调用了KdPollBreakIn() 函数，我们继续跟进kdPollBreakIn()函数，可以看到主要也是对KdPitchDebugger和KdDebuggerEnabled的检测，如果为0就直接退出，返回0
+
+![8](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/8.png)
+
+5.KdCheckForDebugBreak函数接着调用DbgBreakPointWithStatus() 函数
+
+可以发现并没有做什么处理，直接向下执行RtlpBreakWithStatusInstruction()   可以看到我们的int 3 ，中断到调试器
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-04-10/9.png)
+
+我们只需要把这几个函数对于KdPitchDebugger和对于KdDebuggerEnabled检测的几个值替换成我们自己的地址，并设置对应的值，我们就可以继续的双机调试了
+
+但是在最新的TesSafe中，还是失败了，估计又更新了一些点，我这里先研究这些已有的方法。
+
+ 
+
+### 二、KdEnterDebugger
+用于冻结内核，调试后首先会禁止中断，对于多处理器的系统，它会将当前CPU的IRQL升高到HIGH_LEVEL并冻结所有的其他的CPU，锁定调试器的通信端口，调用KdSave()让通信模块保存通信状态，并将全局变量KdEnteredDebugger设置为真，当KdEnterDebugger执行后，整个系统进入一种简单任务状态，当前的CPU只执行当前的线程，其他CPU出于冻结状态。
+
+TP会使用IoAllocateMdl对KdEnterDebugger进行映射，检测当前的KdEnterDebugger值
+
+我们通过Hook IoAllocateMdl来将映射地址更换到别的为0的地方
+
+ 
+
+### 三、针对TP不停的调用KdDisableDebugger来清0 KdDebuggerEnabled来反调试,于是Hook KdDisableDebugger，让其直接返回。
+
+ 
+
+### 四、处理KiDebugRoutine的问题
+
+当内核引擎活动时，KiDebugRoutine这个函数指针是指向的KdpTrap，来处理我们调试是产生的异常，当我们将KiDebugRoutine指向了KdpStub之后，可以绕过对KiDebugRoutine的检测，但是内核调试引擎来处理我们触发的异常时，调用的不是KdpTrap，而变成了KdpStub，很显然不能继续进项调试，所以我们还需要做的一项工作就是hook KdpStub，让他跳转到KdpTrap，这个内核引擎可以正常工作，也可以绕过TP的检测。
+
+并且TP也将KiDebugRoutine的值更换为KdpStub的地址
+
+ 
+
+### 五、将当前KdDebuggerEnabled 设置为0
+
+(因为之前对于windbg接受消息的四个地方已经换成我们的变量，所以此时windbg还能接收到消息)
+
+## 0x04 WINDBG调试TP
+
+思路弄清，开始调试
+
+### 一、替换我们的全局变量 
+
+```cpp
+kd> u KeUpdateSystemTime+0x417
+nt!KeUpdateSystemTime+0x411:
+83ec5d5f 47              inc     edi
+83ec5d60 663bf8          cmp     di,ax
+83ec5d63 72ec            jb      nt!KeUpdateSystemTime+0x403 (83ec5d51)
+83ec5d65 33c9            xor     ecx,ecx
+83ec5d67 8d542420        lea     edx,[esp+20h]
+83ec5d6b 803d002267a600  cmp     byte ptr [PatchTPForDebug!bool_myKdDebuggerEnabled (a6672200)],0
+83ec5d72 7464            je      nt!KeUpdateSystemTime+0x48a (83ec5dd8)
+83ec5d74 a1f841f883      mov     eax,dword ptr [nt!KiPollSlotNext (83f841f8)]
+
+
+kd> u KeUpdateRunTime+0x149
+nt!KeUpdateRunTime+0x149:
+83ec60c2 803d002267a600  cmp     byte ptr [PatchTPForDebug!bool_myKdDebuggerEnabled (a6672200)],0
+83ec60c9 7412            je      nt!KeUpdateRunTime+0x164 (83ec60dd)
+83ec60cb a1ec41f883      mov     eax,dword ptr [nt!KiPollSlot (83f841ec
+
+
+kd> u KdCheckForDebugBreak
+nt!KdCheckForDebugBreak:
+83ec60e9 803d1d2267a600  cmp     byte ptr [PatchTPForDebug!bool_myKdPitchDebugger (a667221d)],0
+83ec60f0 7519            jne     nt!KdCheckForDebugBreak+0x22 (83ec610b)
+83ec60f2 803d002267a600  cmp     byte ptr [PatchTPForDebug!bool_myKdDebuggerEnabled (a6672200)],0
+83ec60f9 7410            je      nt!KdCheckForDebugBreak+0x22 (83ec610b)
+
+
+
+kd> u KdPollBreakIn
+nt!KdPollBreakIn:
+83ec611f 8bff            mov     edi,edi
+83ec6121 55              push    ebp
+83ec6122 8bec            mov     ebp,esp
+83ec6124 51              push    ecx
+83ec6125 53              push    ebx
+83ec6126 33db            xor     ebx,ebx
+83ec6128 381d1d2267a6    cmp     byte ptr [PatchTPForDebug!bool_myKdPitchDebugger (a667221d)],bl
+83ec612e 7407            je      nt!KdPollBreakIn+0x18 (83ec6137)
+
+nt!KdPollBreakIn+0x11:
+83ec6130 32c0            xor     al,al
+83ec6132 e9d2000000      jmp     nt!KdPollBreakIn+0xea (83ec6209)
+83ec6137 885dff          mov     byte ptr [ebp-1],bl
+83ec613a 381d002267a6    cmp     byte ptr [PatchTPForDebug!bool_myKdDebuggerEnabled (a6672200)],bl
+```
+
+第一步成功，我们已经将四个函数中的KdDebuggerEnabled和KdPitchDebugger换成我们自己的变量，这样在之后的KdDebuggerEnabled清0 的时候windbg也能接收到消息。
+
+ 
+
+### 二、注册回调 
+
+注册模块加载回调，当TesSafe.sys加载的时候能够确定其基地址
+
+ 
+
+### 三、Hook IoAllocateMdl 
+```cpp
+kd> u IoAllocateMdl
+nt!IoAllocateMdl:
+83ee04f5 e966f27822      jmp     PatchTPForDebug!MyIoAllocateMdl (a666f760)
+83ee04fa 83ec10          sub     esp,10h
+83ee04fd 8b550c          mov     edx,dword ptr [ebp+0Ch]
+```
+
+成功跳转到我们的模块
+
+我们的fake函数是
+```cpp
+PMDL MyIoAllocateMdl(
+     __in_opt PVOID  VirtualAddress,
+     __in ULONG  Length,
+     __in BOOLEAN  SecondaryBuffer,
+     __in BOOLEAN  ChargeQuota,
+     __inout_opt PIRP  Irp  OPTIONAL)
+ {
+     PVOID pKdEnteredDebugger;
+     pKdEnteredDebugger = (PVOID)GetKdEnteredDebuggerAddr();
+     if (pKdEnteredDebugger == VirtualAddress)
+     {
+         VirtualAddress = (PVOID)((SIZE_T)pKdEnteredDebugger + 0x20);  //+0x20  是让他读到其他的位置
+     }
+	 return old_IoAllocateMdl(VirtualAddress,Length,SecondaryBuffer,ChargeQuota,Irp);
+ }
+```
+
+我在12行的地方下了断点，当TesSafe加载的时候，就断在里面，走出去就能发现进入了TesSafe模块，在对KdDisableDebugger设置断点的时候却不能断下来
+
+### 四、Hook  KdpStub
+
+```cpp 
+kd> u KdpStub
+nt!KdpStub:
+83f289af 8bff            mov     edi,edi
+83f289b1 55              push    ebp
+83f289b2 8bec            mov     ebp,esp
+83f289b4 53              push    ebx
+
+kd> u KdpStub
+nt!KdpStub:
+83f289af e93efb2400      jmp     nt!KdpTrap (841784f2)   //Success
+83f289b4 53              push    ebx
+83f289b5 56              push    esi
+```
+
+### 五、Hook KdDisaableDebugger
+
+让其头部直接返回
+
+```cpp
+kd> u KdDisableDebugger
+nt!KdDisableDebugger:
+83f28846 6a01            push    1
+83f28848 e806ffffff      call    nt!KdDisableDebuggerWithLock (83f28753)
+83f2884d c3              ret
+83f2884e cc              int     3
+
+
+kd> u KdDisableDebugger
+nt!KdDisableDebugger:
+83f28846 90              nop
+83f28847 c3              ret
+83f28848 e806ffffff      call    nt!KdDisableDebuggerWithLock (83f28753)
+83f2884d c3              ret
+83f2884e cc              int     3
+```
+
+### 六、改写KdDebuggerEnabled  为0

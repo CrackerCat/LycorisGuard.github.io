@@ -1,0 +1,494 @@
+---
+layout: post
+title: Windows7 x64 了解堆
+date: 2016-09-27 22:49:12 +0900
+category: windows
+---
+## 一、前言
+　　堆对于开发者一般来说是熟悉又陌生的，熟悉是因为我们常常使用new/delete或者malloc/free使用堆，陌生是因为我们基本没有去了解堆的结构。堆在什么地方？怎么申请？怎么释放？系统又是怎么管理堆的呢？
+
+　　带着疑问，这两天看了<软件漏洞分析技术>与<漏洞战争>中关于堆的说明，终于对于堆有一点点的了解了。这里记录一下在学习和调试中的一点笔记。
+
+## 二、关于堆的基本知识
+
+### 1).首先了解空闲双向链表和快速单向链表的概念
+
+　　1.空闲双向链表(空表)
+
+　　空闲堆块的块首中包含一对重要的指针，这对指针用于将空闲堆块组织成双向链表。按照堆块的大小不同，空表总共被分为128条。
+
+　　堆区一开始的堆表区中有一个128项的指针数组，被称作空表索引(Freelist array)。该数组的每一项包括两个指针，用于标识一条空表。
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/1.png)
+
+　　如图所示，空表索引的第二项(free[1])标识了堆中所有大小为8字节的空闲堆块。之后每个索引项指示的空闲堆块递增8字节。例如free[2]为16字节的空闲堆块，free[3]为24字节的空闲堆块，free[127]为1016字节的空闲堆块。
+
+　　　　　　　　空闲堆块的大小 = 索引项(ID) x 8(字节)
+
+　　把空闲堆块按照大小的不同链入不同的空表，可以方便堆管理系统高效检索指定大小的空闲堆块。需要注意的是，空表索引的第一项(free[0])所标识的空表相对比较特殊。这条双向链表链入了所有大于等于1024字节的堆块（小于512KB），升序排列。
+
+　　
+
+　　2.快速单项链表(快表)
+
+　　快表是Windows用来加速堆块分配而采用的一种堆表。这里之所以叫做"快表"是因为这类单项链表中从来不会发生堆块合并(其中的空闲块块首被设置为占用态，用来防止堆块合并)
+
+　　快表也有128条，组织结构与空表类似，只是其中的堆块按照单项链表组织。
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/2.png)
+
+　　快表总是被初始化为空，而且每条快表最多只有4个结点，故很快就会被填满。
+
+　　
+
+### 2）堆块的结构
+
+　　堆块分为块首和块身，实际上，我们使用函数申请得到的地址指针都会越过8字节(32位系统)的块首，直接指向数据区(块身)。堆块的大小包括块首在内的，如果申请32字节，实际会分配40字节，8字节的块首+32字节的块身。同时堆块的单位是8字节，不足8字节按8字节分配。堆块分为占用态和空闲态。
+
+　　其中空闲态结构为：
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/3.png)
+
+　　占用态结构为
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/4.png)
+
+　　空闲态将块首后8个字节用于存放空表指针了。
+
+　　在64位系统，块首大小为16字节，按16字节对齐。
+
+　　
+
+### 3）堆块的分配和释放
+
+　　1.堆块分配
+
+　　堆块分配可以分为三类：快表分配、普通空表分配和零号空表（free[0]分配）。
+
+　　从快表中分配堆块比较简单，包括寻找到大小匹配的空闲堆块、将其状态修改为占用态、把它从堆表中"卸下"、最后返回一个指向堆块快身的指针给程序使用。
+
+　　普通空表分配时首先寻找最优的空闲块分配，若失败，则寻找次优的空闲块分配，即最小的能满足要求的空闲块。
+
+　　零号空表中按照大小升序链着大小不同的空闲块，故在分配时先从free[0]反向查找最后一个块(即最大块)，看能否满足要求，如果满足要求，再正向搜索最小能满足要求的空闲堆块进行分配。
+
+　　当空表中无法找到匹配的"最优"堆块时，一个稍大些的块会被用于分配，这种次优分配发生时，会先从大块中按请求的大小精确地"割"出一块进行分配，然后给剩下的部分重新标注块首，链入空表。
+
+　　由于快表只有在精确匹配才会分配，所以不存在上述现象。
+
+　　
+
+　　2.堆块的释放
+
+　　释放堆块的操作包括将堆块状态改为空闲，链入相应的堆表。所有的释放块都链入堆表的末尾，分配的时候也先从堆表末尾拿。
+
+　　另外需要强调，快表最多只有4项。
+
+ 
+
+　　3.堆块的分配和释放
+
+　　在具体进行堆块分配和释放时，根据操作内存大小不同，Windows采取的策略也会有所不同。可以把内存按照大小分为三类：
+
+　　　　　　小块：Size < 1KB
+
+　　　　　　大块：1KB < Size < 512KB
+
+　　　　　　巨块：Size >= 512KB
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/5.png)
+
+　　在分配的过程中需要注意的几点是：　　
+
+　　(1)快表中的空闲块被设置为占用态，故不会发生堆块合并操作，且只能精确匹配时才会分配。
+
+　　(2)快表是单链表，操作比双链表简单，插入删除都少用很多指令
+
+　　(3)快表只有4项，很容易被填满，因此空表也是被频繁使用的
+
+## 三、调试堆在PEB中的数据结构
+
+### 1）完成C代码，在x64下编译为Release版本，运行
+
+```cpp
+#include "stdafx.h"
+#include <Windows.h>
+#include <iostream>
+using namespace std;
+
+extern "C" PVOID64 _cdecl GetPebx64();
+int _tmain(int argc, _TCHAR* argv[])
+{
+    
+    PVOID64 Peb = 0;
+    Peb = GetPebx64();
+    printf("Peb is 0x%p\r\n",Peb);
+
+    HANDLE hHeap;
+    char *heap;
+    char str[] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";  //0x20
+
+    hHeap = HeapCreate(HEAP_GENERATE_EXCEPTIONS,0x1000,0xffff);
+    getchar();   //用于暂停，便于调试器附加
+
+    heap = (char*)HeapAlloc(hHeap,0,0x20);
+    printf("Heap addr:0x%08p\r\n",heap);
+
+    strcpy(heap,str);
+    printf("str is %s\r\n",heap);
+
+    cin>>Peb;
+    HeapFree(hHeap,0,heap);  //释放
+    HeapDestroy(hHeap);
+
+    cin>>Peb;
+    return 0;
+}
+```
+　　其中GetPebx64()函数为使用.asm文件的汇编，通过gs:[0x60]获得
+```cpp
+.CODE
+  GetPebx64 PROC 
+    mov rax,gs:[60h]
+  ret
+  GetPebx64 ENDP
+END
+```
+　　运行结果为
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/6.png)
+
+　　我们使用Windbg附加，查看PEB结构
+
+```cpp
+0:001> dt _PEB 0x000007FFFFFDB000
+ntdll!_PEB
+   +0x000 InheritedAddressSpace : 0 ''
+   +0x001 ReadImageFileExecOptions : 0 ''
+   +0x002 BeingDebugged    : 0x1 ''
+   +0x003 BitField         : 0x8 ''
+   +0x003 ImageUsesLargePages : 0y0
+   +0x003 IsProtectedProcess : 0y0
+   +0x003 IsLegacyProcess  : 0y0
+   +0x003 IsImageDynamicallyRelocated : 0y1
+   +0x003 SkipPatchingUser32Forwarders : 0y0
+   +0x003 SpareBits        : 0y000
+   +0x008 Mutant           : 0xffffffff`ffffffff Void
+   +0x010 ImageBaseAddress : 0x00000001`3f050000 Void
+   +0x018 Ldr              : 0x00000000`77522640 _PEB_LDR_DATA
+   +0x020 ProcessParameters : 0x00000000`00242170 _RTL_USER_PROCESS_PARAMETERS
+   +0x028 SubSystemData    : (null) 
+   +0x030 ProcessHeap      : 0x00000000`00240000 Void        //进程默认堆的地址
+   +0x038 FastPebLock      : 0x00000000`7752a960 _RTL_CRITICAL_SECTION
+   +0x040 AtlThunkSListPtr : (null) 
+   +0x048 IFEOKey          : (null) 
+   +0x050 CrossProcessFlags : 0
+   +0x050 ProcessInJob     : 0y0
+   +0x050 ProcessInitializing : 0y0
+   +0x050 ProcessUsingVEH  : 0y0
+   +0x050 ProcessUsingVCH  : 0y0
+   +0x050 ProcessUsingFTH  : 0y0
+   +0x050 ReservedBits0    : 0y000000000000000000000000000 (0)
+   +0x058 KernelCallbackTable : (null) 
+   +0x058 UserSharedInfoPtr : (null) 
+   +0x060 SystemReserved   : [1] 0
+   +0x064 AtlThunkSListPtr32 : 0
+   +0x068 ApiSetMap        : 0x000007fe`ff710000 Void
+   +0x070 TlsExpansionCounter : 0
+   +0x078 TlsBitmap        : 0x00000000`77522590 Void
+   +0x080 TlsBitmapBits    : [2] 0x11
+   +0x088 ReadOnlySharedMemoryBase : 0x00000000`7efe0000 Void
+   +0x090 HotpatchInformation : (null) 
+   +0x098 ReadOnlyStaticServerData : 0x00000000`7efe0a90  -> (null) 
+   +0x0a0 AnsiCodePageData : 0x000007ff`fffa0000 Void
+   +0x0a8 OemCodePageData  : 0x000007ff`fffa0000 Void
+   +0x0b0 UnicodeCaseTableData : 0x000007ff`fffd0028 Void
+   +0x0b8 NumberOfProcessors : 4
+   +0x0bc NtGlobalFlag     : 0
+   +0x0c0 CriticalSectionTimeout : _LARGE_INTEGER 0xffffe86d`079b8000
+   +0x0c8 HeapSegmentReserve : 0x100000             //堆的默认保留大小
+   +0x0d0 HeapSegmentCommit : 0x2000                //堆的默认提交大小
+   +0x0d8 HeapDeCommitTotalFreeThreshold : 0x10000  //解除提交的总空闲块阈值
+   +0x0e0 HeapDeCommitFreeBlockThreshold : 0x1000   //解除提交的单块阈值
+   +0x0e8 NumberOfHeaps    : 5                      //进程堆的数量
+   +0x0ec MaximumNumberOfHeaps : 0x10               //ProcessHeaps数组目前的大小
+   +0x0f0 ProcessHeaps     : 0x00000000`7752a6c0  -> 0x00000000`00240000 Void  //一个数组，记录了每一个堆的地址
+   +0x0f8 GdiSharedHandleTable : (null) 
+   +0x100 ProcessStarterHelper : (null) 
+   +0x108 GdiDCAttributeList : 0
+   +0x110 LoaderLock       : 0x00000000`77527490 _RTL_CRITICAL_SECTION
+   +0x118 OSMajorVersion   : 6
+   +0x11c OSMinorVersion   : 1
+   +0x120 OSBuildNumber    : 0x1db1
+   +0x122 OSCSDVersion     : 0x100
+   +0x124 OSPlatformId     : 2
+   +0x128 ImageSubsystem   : 3
+   +0x12c ImageSubsystemMajorVersion : 5
+   +0x130 ImageSubsystemMinorVersion : 2
+   +0x138 ActiveProcessAffinityMask : 0xf
+   +0x140 GdiHandleBuffer  : [60] 0
+   +0x230 PostProcessInitRoutine : (null) 
+   +0x238 TlsExpansionBitmap : 0x00000000`77522580 Void
+   +0x240 TlsExpansionBitmapBits : [32] 1
+   +0x2c0 SessionId        : 1
+   +0x2c8 AppCompatFlags   : _ULARGE_INTEGER 0x0
+   +0x2d0 AppCompatFlagsUser : _ULARGE_INTEGER 0x0
+   +0x2d8 pShimData        : (null) 
+   +0x2e0 AppCompatInfo    : (null) 
+   +0x2e8 CSDVersion       : _UNICODE_STRING "Service Pack 1"
+   +0x2f8 ActivationContextData : 0x00000000`00140000 _ACTIVATION_CONTEXT_DATA
+   +0x300 ProcessAssemblyStorageMap : (null) 
+   +0x308 SystemDefaultActivationContextData : 0x00000000`00130000 _ACTIVATION_CONTEXT_DATA
+   +0x310 SystemAssemblyStorageMap : (null) 
+   +0x318 MinimumStackCommit : 0
+   +0x320 FlsCallback      : 0x00000000`0027fe90 _FLS_CALLBACK_INFO
+   +0x328 FlsListHead      : _LIST_ENTRY [ 0x00000000`0027fa70 - 0x00000000`0027fa70 ]
+   +0x338 FlsBitmap        : 0x00000000`77522570 Void
+   +0x340 FlsBitmapBits    : [4] 3
+   +0x350 FlsHighIndex     : 1
+   +0x358 WerRegistrationData : (null) 
+   +0x360 WerShipAssertPtr : (null) 
+   +0x368 pContextData     : 0x00000000`00150000 Void
+   +0x370 pImageHeaderHash : (null) 
+   +0x378 TracingFlags     : 0
+   +0x378 HeapTracingEnabled : 0y0
+   +0x378 CritSecTracingEnabled : 0y0
+   +0x378 SpareTracingBits : 0y000000000000000000000000000000 (0)
+```
+
+　　我们可以使用dd 0x00000000`7752a6c0查看进程堆的地址
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/7.png)
+
+　　也可以使用!heap -h 命令查看进程堆的地址和分配的大小
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/8.png)
+
+　　而我们可以看到运行结果中分配的地址4A0A90，正好在段4A0000中。
+
+ 
+
+### 2)堆的相关结构
+
+　　我们首先了解下面几个结构_HEAP_ENTRY,_HEAP_SEGMENT,_HEAP。
+
+　　1._HEAP_ENTRY就是块首，下面是一个64位系统堆块的结构，我们在申请得到的地址减去0x10，就可以得到HEAP_ENTRY的首地址。
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/9.png)
+
+　　2._HEAP_SEGMENT是段结构，我们可以这么认为，堆申请内存的大小是以段为单位的，当新建一个堆的时候，系统会默认为这个堆分配一个段叫0号段，通过刚开始的new和malloc分配的空间都是在这个段上分配的，当这个段用完的时候，如果当初创建堆的时候指明了HEAP_GROWABLE这个标志，那么系统会为这个堆在再分配一个段，这个时候新分配的段就称为1号段了，以下以此类推。每个段的开始初便是HEAP_SEGMENT结构的首地址，由于这个结构也是申请的一块内存，所以它前面也会有个HEAP_ENTRY结构：　
+
+![8](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/10.png)
+
+　　我们使用Windbg查看HEAP_SEGMENT结构如下：
+
+```cpp
+ntdll!_HEAP_SEGMENT
+   +0x000 Entry            : _HEAP_ENTRY
+   +0x010 SegmentSignature : Uint4B
+   +0x014 SegmentFlags     : Uint4B
+   +0x018 SegmentListEntry : _LIST_ENTRY
+   +0x028 Heap             : Ptr64 _HEAP　　  //段所属的堆
+   +0x030 BaseAddress      : Ptr64 Void      //段的基地址
+   +0x038 NumberOfPages    : Uint4B　　　　　　//段的内存页数
+   +0x040 FirstEntry       : Ptr64 _HEAP_ENTRY　　//第一个堆块(HEAP_ENTRY指针，堆块一般位于HEAP_SEGMENT后面)
+   +0x048 LastValidEntry   : Ptr64 _HEAP_ENTRY　　//堆块的边界值
+   +0x050 NumberOfUnCommittedPages : Uint4B　　　　//尚未提交的内存页数
+   +0x054 NumberOfUnCommittedRanges : Uint4B　　　　//UnCommittedRanges数组元素数
+   +0x058 SegmentAllocatorBackTraceIndex : Uint2B
+   +0x05a Reserved         : Uint2B
+   +0x060 UCRSegmentList   : _LIST_ENTRY
+```
+
+　　3._HEAP结构
+
+　　HEAP结构则是记录了这个堆的信息，这个结构可以找到HEAP_SEGMENT链表入口，空闲内存链表的入口，内存分配粒度等等信息。HEAP的首地址便是堆句柄的值，但是堆句柄的值又是0号段的首地址也是堆句柄，何解？其实很简单，0号段的HEAP_SEGMENT就在HEAP结构里面，HEAP结构类定义如这样：
+
+```cpp
+0:001> dt ntdll!_HEAP 4a0000
+   +0x000 Entry            : _HEAP_ENTRY
+   +0x010 SegmentSignature : 0xffeeffee
+   +0x014 SegmentFlags     : 0
+   +0x018 SegmentListEntry : _LIST_ENTRY [ 0x00000000`004a0128 - 0x00000000`004a0128 ]
+   +0x028 Heap             : 0x00000000`004a0000 _HEAP
+   +0x030 BaseAddress      : 0x00000000`004a0000 Void
+   +0x038 NumberOfPages    : 0x10
+   +0x040 FirstEntry       : 0x00000000`004a0a80 _HEAP_ENTRY
+   +0x048 LastValidEntry   : 0x00000000`004b0000 _HEAP_ENTRY
+   +0x050 NumberOfUnCommittedPages : 0xe
+   +0x054 NumberOfUnCommittedRanges : 1
+   +0x058 SegmentAllocatorBackTraceIndex : 0
+   +0x05a Reserved         : 0
+   +0x060 UCRSegmentList   : _LIST_ENTRY [ 0x00000000`004a1fe0 - 0x00000000`004a1fe0 ]
+   +0x070 Flags            : 0x1004         //堆标志
+   +0x074 ForceFlags       : 4              //强制标志
+   +0x078 CompatibilityFlags : 0            
+   +0x07c EncodeFlagMask   : 0x100000
+   +0x080 Encoding         : _HEAP_ENTRY
+   +0x090 PointerKey       : 0x5c50b3ba`3fc7668b 
+   +0x098 Interceptor      : 0
+   +0x09c VirtualMemoryThreshold : 0xff00      //最大堆块大小
+   +0x0a0 Signature        : 0xeeffeeff        //HEAP结构的签名
+   +0x0a8 SegmentReserve   : 0x100000          //段的保留空间大小
+   +0x0b0 SegmentCommit    : 0x2000            //每次提交内存的大小
+   +0x0b8 DeCommitFreeBlockThreshold : 0x100   //解除提交的单块阈值
+   +0x0c0 DeCommitTotalFreeThreshold : 0x1000  //解除提交的总空闲块阈值
+   +0x0c8 TotalFreeSize    : 0x151             //空闲块的总大小
+   +0x0d0 MaximumAllocationSize : 0x000007ff`fffdefff   //可分配的最大值
+   +0x0d8 ProcessHeapsListIndex : 5        //本堆在进程堆列表中的索引
+   +0x0da HeaderValidateLength : 0x208     //头结构的验证长度
+   +0x0e0 HeaderValidateCopy : (null) 
+   +0x0e8 NextAvailableTagIndex : 0    //下一个可用的堆块标记索引
+   +0x0ea MaximumTagIndex  : 0         //最大的堆块标记索引
+   +0x0f0 TagEntries       : (null)    //指向用于标记堆块的标记结构
+   +0x0f8 UCRList          : _LIST_ENTRY [ 0x00000000`004a1fd0 - 0x00000000`004a1fd0 ]   //UnCommitedRange Segments
+   +0x108 AlignRound       : 0x1f   
+   +0x110 AlignMask        : 0xffffffff`fffffff0    //用于地址对齐的掩码
+   +0x118 VirtualAllocdBlocks : _LIST_ENTRY [ 0x00000000`004a0118 - 0x00000000`004a0118 ]
+   +0x128 SegmentList      : _LIST_ENTRY [ 0x00000000`004a0018 - 0x00000000`004a0018 ]  //段链表HEAP_SEGMENT
+   +0x138 AllocatorBackTraceIndex : 0
+   +0x13c NonDedicatedListLength : 0　　　　//用于记录回溯信息
+   +0x140 BlocksIndex      : 0x00000000`004a0230 Void
+   +0x148 UCRIndex         : (null) 
+   +0x150 PseudoTagEntries : (null) 
+   +0x158 FreeLists        : _LIST_ENTRY [ 0x00000000`004a0ac0 - 0x00000000`004a0ac0 ]  //空闲块链表数组
+   +0x168 LockVariable     : 0x00000000`004a0208 _HEAP_LOCK　　//用于串行化控制的同步对象
+   +0x170 CommitRoutine    : 0x5c50b3ba`3fc7668b     long  +5c50b3ba3fc7668b
+   +0x178 FrontEndHeap     : (null) 　　　　//用于快速释放堆块的"前端堆"
+   +0x180 FrontHeapLockCount : 0　　　　　　//"前端堆"的锁定计数
+   +0x182 FrontEndHeapType : 0 ''　　　　　　//"前端堆"的类型
+   +0x188 Counters         : _HEAP_COUNTERS
+   +0x1f8 TuningParameters : _HEAP_TUNING_PARAMETERS
+```
+
+　　对比一下上面HEAP_SEGMENT的结构，可以发现HEAP中就包含一个HEAP_SEGMENT结构。
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/11.png)
+
+## 四、定位申请的内存
+
+　　我们知道我们申请的内存地址为4A0A90，根据前面学习的，4A0A90-0x10 = 4A0A80就是_HEAP_ENTRY的地址，而该地址在段4a0000中
+
+### 1)我们使用!heap -a 4a0000查该堆的内容
+
+```cpp
+0:001> !heap -a 4a0000
+Index   Address  Name      Debugging options enabled
+  5:   004a0000 
+    Segment at 00000000004a0000 to 00000000004b0000 (00002000 bytes committed)
+    Flags:                00001004
+    ForceFlags:           00000004
+    Granularity:          16 bytes
+    Segment Reserve:      00100000
+    Segment Commit:       00002000
+    DeCommit Block Thres: 00000100
+    DeCommit Total Thres: 00001000
+    Total Free Size:      00000151
+    Max. Allocation Size: 000007fffffdefff
+    Lock Variable at:     00000000004a0208
+    Next TagIndex:        0000
+    Maximum TagIndex:     0000
+    Tag Entries:          00000000
+    PsuedoTag Entries:    00000000
+    Virtual Alloc List:   004a0118
+    Uncommitted ranges:   004a00f8
+            004a2000: 0000e000  (57344 bytes)
+    FreeList[ 00 ] at 00000000004a0158: 00000000004a0ac0 . 00000000004a0ac0  
+        00000000004a0ab0: 00030 . 01510 [100] - free
+
+    Segment00 at 004a0000:
+        Flags:           00000000
+        Base:            004a0000
+        First Entry:     004a0a80
+        Last Entry:      004b0000
+        Total Pages:     00000010
+        Total UnCommit:  0000000e
+        Largest UnCommit:00000000
+        UnCommitted Ranges: (1)
+
+    Heap entries for Segment00 in Heap 00000000004a0000
+                 address: psize . size  flags   state (requested size)
+        00000000004a0000: 00000 . 00a80 [101] - busy (a7f)
+        00000000004a0a80: 00a80 . 00030 [101] - busy (20)
+        00000000004a0ab0: 00030 . 01510 [100]
+        00000000004a1fc0: 01510 . 00040 [111] - busy (3d)
+        00000000004a2000:      0000e000      - uncommitted bytes.
+```
+
+　　可以看到内存粒度问16字节
+
+```cpp
+Granularity:          16 bytes
+```
+　　继续往下看可以发现堆中正好有地址为4a0a80的一项
+```cpp
+00000000004a0a80: 00a80 . 00030 [101] - busy (20)
+```
+　　第一项为地址，第二项a80为上一项的堆块大小，0x30为该堆块的大小，[101]为是这个内存的标志位，最右边的1表示内存块被占用，然后busy(20)表示这块内存被占用，申请的内存为0x20，加上块首的大小为0x10，一共是0x30
+
+　　
+
+### 2)我们知道了_HEAP_ENTRY的地址为4a0a80，我们查看该结构体
+
+![11](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/12.png)
+
+　　发现这里的Size和我们的0x30完全不符！
+
+　　我们可以看上面的_HEAP结构，Win7下面的_HEAP结构比XP多了两项
+
+```cpp
+   +0x07c EncodeFlagMask   : 0x100000
+   +0x080 Encoding         : _HEAP_ENTRY
+```
+
+ 　　相对于XP，Vista之后增加了对堆块的头结构(HEAP_ENTRY)的编码。编码的目的是引入随机性，增加堆的安全性，防止黑客轻易就可以预测堆的数据结构内容而实施攻击。在_HEAP结构中新增了如下两个字段：
+
+　　其中的EncodeFlagMask用来指示是否启用编码功能，Encoding字段是用来编码的，编码的方法就是用这个Encoding结构与每个堆块的头结构做亦或(XOR)
+
+　　读取_HEAP偏移为0x80的Encoding子结构：注意Size字段是从偏移8开始的两个字节，不是从偏移0开始
+
+![12](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/13.png)
+
+　　我们使用dd查看我们的HEAP_ENTRY信息
+
+![13](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/14.png)
+
+ 　　做异或解码：
+ 
+ ```cpp
+0:001> ?2b552b39^29542b3a
+Evaluate expression: 33619971 = 00000000`02010003
+ ```
+ 
+ 　　低地址的word是Size字段，所以Size字段是0x3，因为是以0x10为内存粒度的，所以字节大小为
+ 
+ ```cpp
+0:001> ?3*0x10
+Evaluate expression: 48 = 00000000`00000030
+ ```
+　　也就是0x30，与我们显示出的正好一致
+
+　　
+
+### 3)内存中的数据
+
+![14](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-09-27/15.png)
+
+## 五、总结
+
+　　1.在PEB中保存这进程的堆地址和数量。
+
+　　2.HEAP结构记录HEAP_SEGMENT的方式采用了链表，这样不再受数组大小的约束，同时将HEAP_SEGMENT字段包含进HEAP，这样各堆段的起始便统一为HEAP_SEGMENT，不再有xp下0号段与其他段那种区别，可以统一进行管理了。
+
+　　3.每个HEAP_SEGMENT都有多个堆块，每个堆块包含块首和块身，块身为我们申请得到的地址。
+
+　　代码链接：[http://pan.baidu.com/s/1bpBm8W3](http://pan.baidu.com/s/1bpBm8W3)
+
+ 　参考：
+
+　　[windbg调试HEAP](https://www.cnblogs.com/dsky/archive/2013/05/15/3079363.html)
+
+　　[堆和堆的调试](http://blog.sina.com.cn/s/blog_68df639b01017wdv.html)
+
+　　<软件漏洞分析技术>
+
+　　<漏洞战争>

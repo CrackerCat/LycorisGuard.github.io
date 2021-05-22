@@ -1,0 +1,620 @@
+---
+layout: post
+title: 计划任务.Job文件的格式
+date: 2020-11-29 12:30:12 +0900
+category: windows
+---
+## 一、计划任务简介
+
+　　计划任务安装微软的接口是有Task Scheduler 1.0 和Task Scheduler 2.0，可以查看微软的链接[About the Task Scheduler](https://docs.microsoft.com/zh-cn/windows/win32/taskschd/about-the-task-scheduler)、[Using The Task Scheduler](https://docs.microsoft.com/zh-cn/windows/win32/taskschd/using-the-task-scheduler)，其中Task Scheduler 2.0是从VISTA之后才支持的。我们可以用系统的at.exe、schtasks.exe来创建计划任务，具体命令可以在网上搜一下。
+
+```cpp
+at  10:05 test.exe
+```
+```cpp
+schtasks /create /sc hourly /mo 5 /sd 03/01/2001 /tn "My App" /tr c:\apps\myapp.exe
+```
+
+下面我们使用这两种例子在windows上创建计划任务
+
+## 二、Task Scheduler 1.0
+
+　　我们可以用 [Task Scheduler 1.0 Programming Considerations](https://docs.microsoft.com/zh-cn/windows/win32/taskschd/programming-considerations) 、[Task Scheduler 1.0 Example](https://docs.microsoft.com/zh-cn/windows/win32/taskschd/task-scheduler-1-0-examples) 在系统上创建一个计划任务
+
+```cpp
+// ITaskScheduler.cpp : Defines the entry point for the console application.
+//
+
+#include "stdafx.h"
+
+#include <windows.h>
+#include <initguid.h>
+#include <ole2.h>
+#include <mstask.h>
+#include <msterr.h>
+#include <objidl.h>
+#include <wchar.h>
+#include <stdio.h>
+#include <atlstr.h>
+
+int _tmain(int argc, _TCHAR* argv[])
+{
+    HRESULT hr = S_OK;
+    ITaskScheduler *pITS;
+
+    /////////////////////////////////////////////////////////////////
+    // Call CoInitialize to initialize the COM library and then 
+    // call CoCreateInstance to get the Task Scheduler object. 
+    /////////////////////////////////////////////////////////////////
+    hr = CoInitialize(NULL);
+    if (SUCCEEDED(hr))
+    {
+        hr = CoCreateInstance(CLSID_CTaskScheduler,
+            NULL,
+            CLSCTX_INPROC_SERVER,
+            IID_ITaskScheduler,
+            (void **)&pITS);
+        if (FAILED(hr))
+        {
+            //CoUninitialize();
+            return 1;
+        }
+    }
+    else
+    {
+        return 1;
+    }
+
+
+    /////////////////////////////////////////////////////////////////
+    // Call ITaskScheduler::NewWorkItem to create new task.
+    /////////////////////////////////////////////////////////////////
+    LPCWSTR pwszTaskName;
+    ITask *pITask;
+    IPersistFile *pIPersistFile;
+    pwszTaskName = L"Test Task";
+
+    hr = pITS->NewWorkItem(pwszTaskName,         // Name of task
+        CLSID_CTask,          // Class identifier 
+        IID_ITask,            // Interface identifier
+        (IUnknown**)&pITask); // Address of task 
+    //  interface
+
+
+    pITS->Release();                               
+    if (FAILED(hr))
+    {
+        CoUninitialize();
+        fprintf(stderr, "Failed calling NewWorkItem, error = 0x%x\n", hr);
+        return 1;
+    }
+
+    ///////////////////////////////////////////////////////////////////
+    // Call ITask::SetParameters to L"" to clear the parameters for
+    // Test Task.
+    ///////////////////////////////////////////////////////////////////
+    LPCWSTR pwszParameters = L"hello";
+
+    hr = pITask->SetParameters(pwszParameters);
+
+    if (FAILED(hr))
+    {
+        wprintf(L"Failed calling ITask::SetParameters: ");
+        wprintf(L"error = 0x%x\n", hr);
+        pITask->Release();
+        CoUninitialize();
+        return 1;
+    }
+
+    ///////////////////////////////////////////////////////////////////
+    // Call ITask::SetApplicationName to specify the Application name
+    // for Test Task.
+    ///////////////////////////////////////////////////////////////////
+    LPCWSTR pwszApplicationName = L"C:\\Windows\\System32\\notepad.exe";
+
+    hr = pITask->SetApplicationName(pwszApplicationName);
+
+    if (FAILED(hr))
+    {
+        wprintf(L"Failed calling ITask::SetApplicationName: ");
+        wprintf(L"error = 0x%x\n", hr);
+        pITask->Release();
+        CoUninitialize();
+        return 1;
+    }
+
+    /////////////////////////////////////////////////////////////////
+    // Call IUnknown::QueryInterface to get a pointer to 
+    // IPersistFile and IPersistFile::Save to save 
+    // the new task to disk.
+    /////////////////////////////////////////////////////////////////
+    hr = pITask->QueryInterface(IID_IPersistFile,
+        (void **)&pIPersistFile);
+
+    pITask->Release();
+    if (FAILED(hr))
+    {
+        CoUninitialize();
+        fprintf(stderr, "Failed calling QueryInterface, error = 0x%x\n", hr);
+        return 1;
+    }
+
+    hr = pIPersistFile->Save(NULL,
+        TRUE);
+    pIPersistFile->Release();
+    if (FAILED(hr))
+    {
+        CoUninitialize();
+        fprintf(stderr, "Failed calling Save, error = 0x%x\n", hr);
+        return 1;
+    }
+
+    CoUninitialize();
+    printf("Created task.\n");
+    return 0;
+}
+```
+
+　　其中创建计划任务过程中，pIPersistFile->Save会在C:\Windows\Tasks目录下创建一个Test Task.job的文件，这个文件格式大概如下，这里只分析了关键字段的偏移
+
+```cpp
+struct  Task{
+    int Unknown;
+    int Unknown1;
+    int Unknown2;
+    int Unknown3;
+    int Unknown4;
+    short startLen;
+    short Length;
+    int Unknown5;
+    int Unknown6;
+    int Unknown7;
+    int Unknown8;
+    int Unknown9;
+    int Unknown10;
+    int Unknown11;
+    int Unknown12;
+    int Unknown13;
+    int Unknown14;
+    int Unknown15;
+    short Unknown16;
+    short pathlength;
+    char path[pathlength*2];
+    short parameterlen;
+    char parameter[parameterlen*2];
+    short Unknown17;
+    short UserNameLen;
+    char User[UserNameLen*2];
+};
+```
+
+　　.Job文件创建后，会通过文件修改回调通知到svchost.exe服务进程的taskcomp!CompatibilityAdapter[::IFileChangeNotification]::ContentChange中，而ContentChange的服务收到通知后，会调用ContentChange -> CompatibilityAdapter::ActivateJob -> CompatibilityAdapter::LoadJob -> CJob::LoadP去加载计划任务。
+
+## 三、Task Scheduler 2.0
+
+　　Task Scheduler 2.0编程接口可以参考[Using The Task Scheduler](https://docs.microsoft.com/zh-cn/windows/win32/taskschd/using-the-task-scheduler)来进行创建
+
+```cpp
+// ITaskScheduler.cpp : Defines the entry point for the console application.
+//
+
+#include "stdafx.h"
+
+#include <windows.h>
+#include <initguid.h>
+#include <ole2.h>
+#include <mstask.h>
+#include <msterr.h>
+#include <objidl.h>
+#include <wchar.h>
+#include <stdio.h>
+#include <atlstr.h>
+
+
+/********************************************************************
+ This sample schedules a task to start on a weekly basis. 
+********************************************************************/
+
+#define _WIN32_DCOM
+
+#include <windows.h>
+#include <iostream>
+#include <stdio.h>
+#include <comdef.h>
+#include <wincred.h>
+//  Include the task header file.
+#include <taskschd.h>
+#pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "comsupp.lib")
+#pragma comment(lib, "credui.lib")
+
+using namespace std;
+
+
+int _tmain(int argc, _TCHAR* argv[])
+{
+    //  ------------------------------------------------------
+    //  Initialize COM.
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if( FAILED(hr) )
+    {
+        printf("\nCoInitializeEx failed: %x", hr );
+        return 0;
+    }
+
+    //  Set general COM security levels.
+    hr = CoInitializeSecurity(
+        NULL,
+        -1,
+        NULL,
+        NULL,
+        RPC_C_AUTHN_LEVEL_PKT,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        NULL,
+        0,
+        NULL);
+
+    if( FAILED(hr) )
+    {
+        printf("\nCoInitializeSecurity failed: %x", hr );
+        CoUninitialize();
+        return 0;
+    }
+
+    //  ------------------------------------------------------
+    //  Create a name for the task.
+    LPCWSTR wszTaskName = L"Weekly Trigger Task";
+
+    //  Get the windows directory and set the path to notepad.exe.
+    wstring wstrExecutablePath = _wgetenv( L"WINDIR");
+    wstrExecutablePath += L"\\SYSTEM32\\NOTEPAD.EXE";
+
+
+    //  ------------------------------------------------------
+    //  Create an instance of the Task Service. 
+    ITaskService *pService = NULL;
+    hr = CoCreateInstance( CLSID_TaskScheduler,
+        NULL,
+        CLSCTX_INPROC_SERVER,
+        IID_ITaskService,
+        (void**)&pService );  
+    if (FAILED(hr))
+    {
+        printf("Failed to create an instance of ITaskService: %x", hr);
+        CoUninitialize();
+        return 0;
+    }
+
+    //  Connect to the task service.
+    hr = pService->Connect(_variant_t(), _variant_t(),
+        _variant_t(), _variant_t());
+    if( FAILED(hr) )
+    {
+        printf("ITaskService::Connect failed: %x", hr );
+        pService->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  ------------------------------------------------------
+    //  Get the pointer to the root task folder.  
+    //  This folder will hold the new task that is registered.
+    ITaskFolder *pRootFolder = NULL;
+    hr = pService->GetFolder( _bstr_t( L"\\") , &pRootFolder );
+    if( FAILED(hr) )
+    {
+        printf("Cannot get Root Folder pointer: %x", hr );
+        pService->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  If the same task exists, remove it.
+    pRootFolder->DeleteTask( _bstr_t( wszTaskName), 0  );
+
+    //  Create the task builder object to create the task.
+    ITaskDefinition *pTask = NULL;
+    hr = pService->NewTask( 0, &pTask );
+
+    pService->Release();  // COM clean up.  Pointer is no longer used.
+    if (FAILED(hr))
+    {
+        printf("Failed to create a task definition: %x", hr);
+        pRootFolder->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  ------------------------------------------------------
+    //  Get the registration info for setting the identification.
+    IRegistrationInfo *pRegInfo= NULL;
+    hr = pTask->get_RegistrationInfo( &pRegInfo );
+    if( FAILED(hr) )
+    {
+        printf("\nCannot get identification pointer: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    hr = pRegInfo->put_Author( L"Author Name" );
+    pRegInfo->Release();  // COM clean up.  Pointer is no longer used.
+    if( FAILED(hr) )
+    {
+        printf("\nCannot put identification info: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  ------------------------------------------------------
+    //  Get the trigger collection to insert the weekly trigger.
+    ITriggerCollection *pTriggerCollection = NULL;
+    hr = pTask->get_Triggers( &pTriggerCollection );
+    if( FAILED(hr) )
+    {
+        printf("\nCannot get trigger collection: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    ITrigger *pTrigger = NULL;
+    hr = pTriggerCollection->Create( TASK_TRIGGER_WEEKLY, &pTrigger );     
+    pTriggerCollection->Release();
+    if( FAILED(hr) )
+    {
+        printf("\nCannot create the trigger: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    IWeeklyTrigger *pWeeklyTrigger = NULL;
+    hr = pTrigger->QueryInterface( 
+        IID_IWeeklyTrigger, (void**) &pWeeklyTrigger );
+    pTrigger->Release();
+    if( FAILED(hr) )
+    {
+        printf("\nQueryInterface call for IWeeklyTrigger failed: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    hr = pWeeklyTrigger->put_Id( _bstr_t( L"Trigger1" ) );
+    if( FAILED(hr) )
+        printf("\nCannot put trigger ID: %x", hr);
+
+    //  Set the task to start weekly at a certain time. The time 
+    //  format should be YYYY-MM-DDTHH:MM:SS(+-)(timezone).
+    //  For example, the start boundary below is January 1st 2005 at
+    //  12:05
+    hr = pWeeklyTrigger->put_StartBoundary( _bstr_t(L"2005-01-01T12:05:00") );
+    if( FAILED(hr) )
+        printf("\nCannot put the start boundary: %x", hr);
+
+    //  Set the time when the trigger is deactivated.
+    hr = pWeeklyTrigger->put_EndBoundary( _bstr_t(L"2007-01-01T12:05:00") );
+    if( FAILED(hr) )
+        printf("\nCannot put the end boundary: %x", hr);
+
+
+    //  Define the interval for the weekly trigger. 
+    //  An interval of 2 produces an
+    //  every other week schedule
+    hr = pWeeklyTrigger->put_WeeksInterval( (short)2 );
+    if( FAILED(hr) )
+    {
+        printf("\nCannot put weeks interval: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    hr = pWeeklyTrigger->put_DaysOfWeek( (short)2 );    // Runs on Monday
+    pWeeklyTrigger->Release();
+    if( FAILED(hr) )
+    {
+        printf("\nCannot put days of week interval: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  ------------------------------------------------------
+    //  Add an Action to the task. This task will execute notepad.exe.     
+    IActionCollection *pActionCollection = NULL;
+
+    //  Get the task action collection pointer.
+    hr = pTask->get_Actions( &pActionCollection );
+    if( FAILED(hr) )
+    {
+        printf("\nCannot get Task collection pointer: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  Create the action, specifying that it is an executable action.
+    IAction *pAction = NULL;
+    hr = pActionCollection->Create( TASK_ACTION_EXEC, &pAction );
+    pActionCollection->Release();
+    if( FAILED(hr) )
+    {
+        printf("\nCannot create the action: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    IExecAction *pExecAction = NULL;
+    //  QI for the executable task pointer.
+    hr = pAction->QueryInterface( 
+        IID_IExecAction, (void**) &pExecAction );
+    pAction->Release();
+    if( FAILED(hr) )
+    {
+        printf("\nQueryInterface call failed on IExecAction: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  Set the path of the executable to notepad.exe.
+    hr = pExecAction->put_Path( _bstr_t( wstrExecutablePath.c_str() ) );
+    pExecAction->Release();
+    if( FAILED(hr) )
+    {
+        printf("\nCannot add path for executable action: %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        CoUninitialize();
+        return 0;
+    }
+
+    //  ------------------------------------------------------
+    //  Securely get the user name and password. The task will
+    //  be created to run with the credentials from the supplied 
+    //  user name and password.
+    CREDUI_INFO cui;
+    TCHAR pszName[CREDUI_MAX_USERNAME_LENGTH] = L"";
+    TCHAR pszPwd[CREDUI_MAX_PASSWORD_LENGTH] = L"";
+    BOOL fSave;
+    DWORD dwErr;
+
+    cui.cbSize = sizeof(CREDUI_INFO);
+    cui.hwndParent = NULL;
+    //  Ensure that MessageText and CaptionText identify
+    //  what credentials to use and which application requires them.
+    cui.pszMessageText = TEXT("Account information for task registration:");
+    cui.pszCaptionText = TEXT("Enter Account Information for Task Registration");
+    cui.hbmBanner = NULL;
+    fSave = FALSE;
+
+    //  Create the UI asking for the credentials.
+    dwErr = CredUIPromptForCredentials(
+        &cui,                             //  CREDUI_INFO structure
+        TEXT(""),                         //  Target for credentials
+        NULL,                             //  Reserved
+        0,                                //  Reason
+        pszName,                          //  User name
+        CREDUI_MAX_USERNAME_LENGTH,       //  Max number for user name
+        pszPwd,                           //  Password
+        CREDUI_MAX_PASSWORD_LENGTH,       //  Max number for password
+        &fSave,                           //  State of save check box
+        CREDUI_FLAGS_GENERIC_CREDENTIALS |  //  Flags
+        CREDUI_FLAGS_ALWAYS_SHOW_UI |
+        CREDUI_FLAGS_DO_NOT_PERSIST);  
+
+    if(dwErr)
+    {
+        cout << "Did not get credentials." << endl;    
+        CoUninitialize();
+        return 0;      
+    }
+
+
+    //  ------------------------------------------------------
+    //  Save the task in the root folder.
+    IRegisteredTask *pRegisteredTask = NULL;
+    hr = pRootFolder->RegisterTaskDefinition(
+        _bstr_t( wszTaskName ),
+        pTask,
+        TASK_CREATE_OR_UPDATE, 
+        _variant_t(_bstr_t(pszName)), 
+        _variant_t(_bstr_t(pszPwd)), 
+        TASK_LOGON_PASSWORD,
+        _variant_t(L""),
+        &pRegisteredTask);
+    if( FAILED(hr) )
+    {
+        printf("\nError saving the Task : %x", hr );
+        pRootFolder->Release();
+        pTask->Release();
+        SecureZeroMemory(pszName, sizeof(pszName));
+        SecureZeroMemory(pszPwd, sizeof(pszPwd));
+        CoUninitialize();
+        return 0;
+    }
+
+    printf("\n Success! Task succesfully registered. " );
+
+    //  Clean up
+    pRootFolder->Release();
+    pTask->Release();
+    pRegisteredTask->Release();
+    SecureZeroMemory(pszName, sizeof(pszName));
+    SecureZeroMemory(pszPwd, sizeof(pszPwd));
+    CoUninitialize();
+    return 0;
+}
+```
+
+　　该种方式会在C:\Windows\System32\Tasks目录下创建Weekly Trigger Task.Job文件，这种文件格式直接是xml格式
+
+```cpp
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Author Name</Author>
+    <URI>\Weekly Trigger Task</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger id="Trigger1">
+      <StartBoundary>2005-01-01T12:05:00</StartBoundary>
+      <EndBoundary>2007-01-01T12:05:00</EndBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <DaysOfWeek>
+          <Monday />
+        </DaysOfWeek>
+        <WeeksInterval>2</WeeksInterval>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\SYSTEM32\NOTEPAD.EXE</Command>
+    </Exec>
+  </Actions>
+  <Principals>
+    <Principal id="Author">
+      <UserId>Test</UserId>
+      <LogonType>Password</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+</Task>
+```

@@ -1,0 +1,82 @@
+---
+layout: post
+title: 通过TLS回调函数的反调试
+date: 2016-02-24 13:42:12 +0900
+category: windowsDebug
+---
+
+　　下面是TLS数据结构的定义
+
+```cpp
+typedef struct _IMAGE_TLS_DIRECTORY
+{
+          DWORD StartAddressOfRawData;
+          DWORD EndAddressOfRawData;
+          DWORD AddressOfIndex;
+          DWORD AddressOfCallBacks;  //PIMAGE_TLS_CALLBACK*
+          DWORD SizeOfZeroFill;
+          DWORD Characteristics;
+}IMAGE_TLS_DIRECTORY;
+```
+　　AddressOfCallBacks是一个数组，表示可以有多个TLS回调函数，所谓的TLS回调函数，就是当创建/终止进程的线程时会自动调用的执行的函数。
+
+　　创建进程的主线程也会自动调用回调函数，且其调用执行先于EP代码，反调试技术利用的就是TLS回调函数这一特性。
+
+　　回调函数定义如下
+
+```cpp
+typedef VOID 
+(NTAPI *PIMAGE_TLS_CALLBACK)(
+         PVOID DllHandle,
+         DOWRD Reason,  //DLL_PROCESS_ATTACH,DLL_THREAD_ATTACH,DLL_THREAD_DETACH,DLL_PROCESS_DETACH
+         PVOID Reserved
+); 
+```
+
+　　进程调用main前，已注册的TLS回调函数会被调用执行，此时Reason为DLL_PROCESS_ATTACH
+
+之后创建线程，结束线程，进程结束都会调用TLS回调函数，进程周期内TLS回调函数会被调用4次。
+```cpp
+#include "stdafx.h"
+#include<windows.h>
+#include "tlhelp32.h"
+
+
+#pragma comment(linker, "/INCLUDE:__tls_used")
+VOID NTAPI TLS_CALLBACK(PVOID DllHandle,DWORD Reason,DWORD Reserved)
+{
+    DWORD Flag;
+    __asm{
+        mov eax,fs:[0x30]
+        movzx eax,BYTE PTR DS:[eax+2]  //PEB.BingDebugged
+        mov Flag,eax
+    }
+    if(Flag==1)
+    {
+        MessageBox(NULL,L"Error",L"Error",1);
+        ULONG nProcessID = 0;
+        HWND  hFindWindow = FindWindow(NULL,L"OLLYDBG");
+        ::GetWindowThreadProcessId( hFindWindow, &nProcessID );
+        HANDLE hProcessHandle = ::OpenProcess( PROCESS_TERMINATE, FALSE,nProcessID );
+        TerminateProcess( hProcessHandle, 4 );
+        ExitProcess(0);
+    }
+    else
+    {
+        MessageBox(NULL,L"OK",L"OK",1);
+    }
+}
+
+
+#pragma  data_seg(".CRT$XLX")
+    PIMAGE_TLS_CALLBACK pTLS_CALLBACKs[] ={(PIMAGE_TLS_CALLBACK)TLS_CALLBACK,0};
+#pragma data_seg()
+
+
+int _tmain(int argc, _TCHAR* argv[])
+{
+    MessageBox(NULL,L"HelloWorld",L"Exit",1);
+}
+```
+
+　　这里就是利用TLS回调函数检测是否处于调试状态

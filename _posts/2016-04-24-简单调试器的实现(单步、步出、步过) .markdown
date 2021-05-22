@@ -1,0 +1,57 @@
+---
+layout: post
+title: 简单调试器的实现(单步、步出、步过) 
+date: 2016-04-24 19:31:12 +0900
+category: windowsDebug
+---
+## 一、实现单步
+　　通过设置TF标志位，每次执行都会在下一个指令的时候断下来，断点在恢复后重新设置也需要使用这个标志位
+```cpp
+//设置TF标志位
+void SetTrapFlag() {
+    CONTEXT context = {0};
+    GetDebuggeeContext(&context);
+    context.EFlags |= 0x100;
+    SetDebuggeeContext(&context);
+ 
+}
+```
+
+## 二、实现步出
+
+　　步出则是在ebp+4的地址设置断点，ebp+4保存的就是该函数的返回地址，也是上一个函数call指令的下一条指令
+```cpp
+BOOL MoveOut()
+{
+    // 获取ebp
+    CONTEXT    Context = {0};
+    GetDebuggeeContext(&Context);
+    // 获取ebp+4处保存的返回地址
+    SIZE_T    addr = 0;
+    if(!ReadDebuggeeMemory(Context.Ebp + 4,sizeof(addr),(LPVOID)&addr))
+    {
+        return FALSE;
+    }
+    // 设置一次性断点
+    SetCCBreakPointAt(addr,SOFTTYPE_ONCE);
+    return TRUE;
+}
+```
+
+## 三、步过的实现
+　　步过则是获得下一条指令长度，在下下条指令下断点
+```cpp
+//步过，获得eip下一条指令的长度，越过这条指令下断点，这样就不会进入call里面
+BOOL MoveOver()
+{
+    CONTEXT    Context = {0};
+    GetDebuggeeContext(&Context);
+    SIZE_T addr = GetCoodeLen(Context.Eip) + Context.Eip;
+    SetCCBreakPointAt(addr,SOFTTYPE_ONCE);
+    return TRUE;
+}
+```
+## 四、代码下载
+ 　  关于之前硬件断点的问题，发现设置1个字节的断点就能断下来，不过在断点恢复的时候，设置TF恢复就不能正常运行。
+
+　　代码链接  [http://pan.baidu.com/s/1qXYKjxU](http://pan.baidu.com/s/1qXYKjxU)

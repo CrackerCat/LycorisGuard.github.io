@@ -1,0 +1,711 @@
+---
+layout: post
+title: 深入学习APC
+date: 2016-04-04 22:55:12 +0900
+category: windowsDriver
+---
+## 一、前言
+　　APCs(Asynchronous Procedure Calls), 在NT中，有两种类型的APCs：用户模式和内核模式。用户APCs运行在用户模式下目标线程当前上下文中，并且需要从目标线程得到许可来运行。特别是，用户模式的APCs需要目标线程处在alertable等待状态才能被成功的调度执行。通过调用下面任意一个函数，都可以让线程进入这种状态。这些函数是：KeWaitForSingleObject, KeWaitForMultipleObjects, KeWaitForMutexObject, KeDelayExecutionThread。
+
+　　对于用户模式下，可以调用函数SleepEx, SignalObjectAndWait, WaitForSingleObjectEx, WaitForMultipleObjectsEx,MsgWaitForMultipleObjectsEx 都可以使目标线程处于alertable等待状态，从而让用户模式APCs执行,原因是这些函数最终都是调用了内核中的KeWaitForSingleObject, KeWaitForMultipleObjects, KeWaitForMutexObject, KeDelayExecutionThread等函数。另外通过调用一个未公开的alert-test服务KeTestAlertThread，用户线程可以使用户模式APCs执行。
+
+## 0x02   APC相关结构与位置
+　　系统中每一个线程都包含两个APC队列，一个为用户模式APC队列，一个为内核模式APC队列，存储在KAPC_STATE结构中。而KAPC_STATE结构指针在线程结构体ETHREAD中有两个，一个是ApcState，一个是SaveApcState，为了进程Attach准备，当A进程附加到B进程，SaveApcState保存原来A进程的Apc队列，ApcState保存被附加B进程的Apc队列。
+
+　　下面是KTHREAD中关于Apc的成员位置
+```cpp
+lkd> dt _kthread
+ntdll!_KTHREAD
+   +0x000 Header           : _DISPATCHER_HEADER
+   +0x010 MutantListHead   : _LIST_ENTRY
+   +0x018 InitialStack     : Ptr32 Void
+   +0x01c StackLimit       : Ptr32 Void
+   +0x020 Teb              : Ptr32 Void
+   +0x024 TlsArray         : Ptr32 Void
+   +0x028 KernelStack      : Ptr32 Void
+   +0x02c DebugActive      : UChar
+   +0x02d State            : UChar
+   +0x02e Alerted          : [2] UChar
+   +0x030 Iopl             : UChar
+   +0x031 NpxState         : UChar
+   +0x032 Saturation       : Char
+   +0x033 Priority         : Char
+   +0x034 ApcState         : _KAPC_STATE
+   +0x04c ContextSwitches : Uint4B
+   ...
+   +0x134 TrapFrame        : Ptr32 _KTRAP_FRAME
+   +0x138 ApcStatePointer  : [2] Ptr32 _KAPC_STATE
+　 +0x140 PreviousMode     : Char
+   +0x141 EnableStackSwap  : UChar
+   +0x142 LargeStack       : UChar
+   +0x143 ResourceIndex    : UChar
+   +0x144 KernelTime       : Uint4B
+   +0x148 UserTime         : Uint4B
+   +0x14c SavedApcState    : _KAPC_STATE
+   +0x164 Alertable        : UChar
+   +0x165 ApcStateIndex    : UChar
+```
+### 1.KAPC_STATE结构为
+```cpp
+typedef struct _KAPC_STATE {
+        LIST_ENTRY ApcListHead[MaximumMode];       //线程的apc链表 只有两个 内核态和用户态
+        struct _KPROCESS *Process;               //当前线程的进程体   PsGetCurrentProcess()
+        BOOLEAN KernelApcInProgress;              //内核APC正在执行
+        BOOLEAN KernelApcPending;                 //内核APC正在等待执行
+        BOOLEAN UserApcPending;                  //用户APC正在等待执行
+} KAPC_STATE, *PKAPC_STATE, *PRKAPC_STATE;
+```
+### 2.ApcStatePointer
+　　对于一个APC对象，决定当前APC环境的是ApcStateIndex域。ApcStateIndex域的值作为ApcStatePointer域数组的索引来得到目标APC环境指针。随后，目标APC环境指针用来在相应的队列中存放apc对象.
+```cpp
+typedef enum _KAPC_ENVIRONMENT {
+　　OriginalApcEnvironment, //原始的进程环境
+　　AttachedApcEnvironment, //挂靠后的进程环境
+　　CurrentApcEnvironment, // 当前环境
+ 　 InsertApcEnvironment   //被插入时的环境
+} KAPC_ENVIRONMENT;
+#pragma pack()
+```
+　　实际可用于ApcStateIndex的只是OriginalApcEnvironment(0)和AttachedApcEnvironment(1)
+
+　　当ApcStateIndex为OriginalApcEnvironment时，Process指向当前的进程，
+
+　　当为AttachedApcEnvironment时，ApcState指向挂靠的进程，SaveApcState指向的才是原来所属的进程
+
+　　所以ApcState中的Process一直指向的是"当前进程"，PsGetCurrentProcess就是返回的ApcState中的Process, KeCurrentThread()->Process指向的是挂靠前的进程, 即"OriginalProcess".
+
+　　常态下ApcStatePointer[0]指向ApcState，而ApcStatePointer[1]指向SavedApcState，挂靠后相反。
+
+### 3.APC结构体
+```cpp 
+typedef struct _KAPC {
+    CSHORT Type;
+    CSHORT Size;
+    ULONG Spare0;
+    struct _KTHREAD *Thread;
+    LIST_ENTRY ApcListEntry;                  // 插入线程APC链表
+    PKKERNEL_ROUTINE KernelRoutine;           //内核模式中执行
+    PKRUNDOWN_ROUTINE RundownRoutine;         // 线程终止时还有APC没执行会调用这个函数
+    PKNORMAL_ROUTINE NormalRoutine; //这个为0 表示是一个特殊内核APC，否则是一个普通的（又分为内核态的和用户态的）。特殊的位于链表前部，普通的位于后部。 普通的APC，normal和kernel例程都将被调用
+    PVOID NormalContext;
+    //
+    // N.B. The following two members MUST be together.
+    //
+    PVOID SystemArgument1;
+    PVOID SystemArgument2;
+    CCHAR ApcStateIndex;                          //APC环境状态
+    KPROCESSOR_MODE ApcMode;                      // 内核态or用户态
+    BOOLEAN Inserted;
+} KAPC, *PKAPC, *RESTRICTED_POINTER PRKAPC;
+```
+
+## 0x03   进程KeAttachProcess/KeDetachProcess时，APC的变化
+
+### 1.KeAttachProcess
+
+　　当一个线程调用KeAttachProcess，在另外的进程上下文中执行后续的代码时，ApcState域的内容就被拷贝到SavedApcState域。然后ApcState域被清空，它的APC队列重新初始化，控制变量设置为0，当前进程域设置为新的进程。这些步骤成功的确保先前在线程所属的进程上下文地址空间中等待的APCs，当线程运行在其它不同的进程上下文时，这些APCs不被传送执行。随后，ApcStatePointer域数组内容被更新来反映新的状态，数组中第一个元素指向SavedApcState域，第二个元素指向ApcState域，表明线程所属进程上下文的APC环境位于SavedApcState域。线程的新的进程上下文的APC环境位于ApcState域。最后，当前进程上下文切换到新的进程上下文。
+
+　　对于一个APC对象，决定当前APC环境的是ApcStateIndex域。ApcStateIndex域的值作为ApcStatePointer域数组的索引来得到目标APC环境指针。随后，目标APC环境指针用来在相应的队列中存放apc对象.
+
+　　KiAttacchProcess中实现如下：
+```cpp
+KiMoveApcState(&Thread->ApcState, SavedApcState); //当前的APC状态移到Save里，然后初始化apc状态
+
+InitializeListHead(&Thread->ApcState.ApcListHead[KernelMode]); //ApcState被初始化
+
+InitializeListHead(&Thread->ApcState.ApcListHead[UserMode]);
+Thread->ApcState.KernelApcInProgress = FALSE;
+Thread->ApcState.KernelApcPending = FALSE;
+Thread->ApcState.UserApcPending = FALSE;
+if (SavedApcState == &Thread->SavedApcState) {
+            Thread->ApcStatePointer[0] = &Thread->SavedApcState;           //第一个指向保存的apc状态 原始apc环境
+            Thread->ApcStatePointer[1] = &Thread->ApcState;                //第二个是当前的 挂靠apc环境
+            Thread->ApcStateIndex = 1;                                     //表示现在的状态指向 指向挂靠状态
+}
+```
+　　注意已经Attach的进程再次Attach会BSOD！
+### 2.KeDetachProcess
+　　当线程从新的进程中脱离时(KeDetachProcess), 任何在新的进程地址空间中等待执行的未决的内核APCs被派发执行。随后SavedApcState 域的内容被拷贝回ApcState域。SavedApcState 域的内容被清空，线程的ApcStateIndex域被设为OriginalApcEnvironment，ApcStatePointer域更新，当前进程上下文切换到线程所属进程。 
+
+　　Dettach时，先派发APC State里面的APC，然后再恢复，也就是挂靠过程中线程被插apc现在要集中解决
+```cpp
+while (Thread->ApcState.KernelApcPending &&
+            (Thread->SpecialApcDisable == 0) &&
+            (LockHandle.OldIrql < APC_LEVEL)) 
+{       
+    //
+    // Unlock the thread APC lock and lower IRQL to its previous
+    // value. An APC interrupt will immediately occur which will
+    // result in the delivery of the kernel APC if possible.
+    //释放这个锁将导致 请求APC级别的中断，这样apc将得到释放
+    KeReleaseInStackQueuedSpinLock(&LockHandle);
+    KeAcquireInStackQueuedSpinLockRaiseToSynch(&Thread->ApcQueueLock, &LockHandle);
+}
+//
+//省略无关代码，到这里进行恢复
+//
+KiMoveApcState(&Thread->SavedApcState, &Thread->ApcState); //恢复了
+Thread->SavedApcState.Process = (PKPROCESS)NULL;
+Thread->ApcStatePointer[0] = &Thread->ApcState;
+Thread->ApcStatePointer[1] = &Thread->SavedApcState;
+Thread->ApcStateIndex = 0;
+//
+//ApcStatePointer这样设计是巧妙的
+//
+```
+
+## 0x04   内核插入APC
+
+### 1.使用KeInitializeApc初始化apc结构体
+
+　　这个函数用来初始化APC对象。函数接受一个驱动分配的APC对象，一个目标线程对象指针，APC环境索引（指出APC对象存放于哪个APC环境），APC的kernel,rundown和normal例程指针，APC类型（用户模式或者内核模式）和一个上下文参数。
+```cpp
+NTKERNELAPI
+    VOID
+    KeInitializeApc (
+    IN PRKAPC Apc,
+    IN PKTHREAD Thread,
+    IN KAPC_ENVIRONMENT Environment, 
+    IN PKKERNEL_ROUTINE KernelRoutine,
+    IN PKRUNDOWN_ROUTINE RundownRoutine OPTIONAL,
+    IN PKNORMAL_ROUTINE NormalRoutine OPTIONAL,     //并非真正的目标函数，相当于门户作用
+    IN KPROCESSOR_MODE ApcMode,
+    IN PVOID Context                        //真正我们实现的函数
+    )
+{
+    
+    RtlZeroMemory(Apc,sizeof(KAPC));
+    Apc->Type = ApcObject;  // APC是类型为ApcObejct的内核对象
+    Apc->Size = sizeof(KAPC);
+
+    if (Environment == CurrentApcEnvironment) { //当前环境，那Index就是线程的
+        Apc->ApcStateIndex = Thread->ApcStateIndex;
+
+    } else {
+
+        ASSERT((Environment <= Thread->ApcStateIndex) || (Environment == InsertApcEnvironment));
+
+        Apc->ApcStateIndex = (CCHAR)Environment;
+    }
+    Apc->Thread = Thread;
+    Apc->KernelRoutine = KernelRoutine;
+    Apc->RundownRoutine = RundownRoutine;
+    Apc->NormalRoutine = NormalRoutine;
+
+    /*Check if this a special APC*/
+    if(NormalRoutine)
+    {
+        //NormalRoutine非空,是需要在用户空间执行的APC函数
+        /*it's a normal one. Set the context and mode */
+        Apc->ApcMode = Mode;
+        Apc->NormalContext = Context;   //我们真正认为的APC执行函数
+    }
+    else
+    {
+        //没有需要在用户空间执行的NormalRoutine
+        /*it's a special APC,which can only be kernel mode*/
+        Apc->ApcMode = KernelMode;
+        Apc->NormalContext = NULL;
+    }    
+    Apc->Inserted = FALSE;
+```
+　　KeInitializeApc 首先设置APC对象的Type和Size域一个适当的值，然后检查参数Environment的值，如果是CurrentApcEnvironment，那么ApcStateIndex域设置为目标线程的ApcStateIndex域。否则，ApcStateIndex域设置为参数Environment的值。
+
+　　随后，函数直接用参数设置APC对象Thread，RundownRoutine，KernelRoutine域的值。为了正确地确定APC的类型，KeInitializeApc 检查参数NORMAL_ROUTINE的值，如果是NULL，ApcMode域的值设置为KernelMode，NormalContext域设置为NULL。
+
+　　如果NORMAL_ROUTINE的值不是NULL，这时候它一定指向一个有效的例程，就用相应的参数来设置ApcMode域和NormalContext域。最后，KeInitializeApc 设置Inserted域为FALSE.然而初始化APC对象，并没有把它存放到相应的APC队列中。
+
+ 　　从代码可以看出，APCs对象如果缺少有效的NORMAL_ROUTINE，就会被当作内核模式APCs.尤其是它们会被认为是特殊的内核模式APCs.
+
+　　任意类型的APC都可以定义一个有效的RundownRoutine，这个例程必须在内核内存区域，并且仅仅当系统需要释放APC队列的内容时，才被调用。例如线程退出时，在这种情况下，KernelRoutine和NormalRoutine都不执行，只有RundownRoutine执行。没有这个例程的APC对象会被删除。
+
+ 
+
+### 2.使用KeInsertQueueApc函数将apc对象插入apc队列
+　　一旦APC对象完成初始化后，设备驱动调用KeInsertQueueApc来将APC对象存放到目标线程的相应的APC队列中。这个函数接受一个由KeInitializeApc完成初始化的APC对象指针，两个系统参数和一个优先级增量。跟传递给KeInitializeApc函数的参数context 一样，这两个系统参数只是在APC的例程执行时，简单的传递给APC的例程。
+```cpp
+BOOLEAN KeInsertQueueApc(
+    PRKAPC Apc,
+    PVOID SystemArgument1,
+    PVOID SystemArgument2,
+    KPRIORITY Increment
+    )
+{
+    PKTHREAD Thread = Apc->Thread;
+       
+       ...
+    
+    KeAcquireInStackQueuedSpinLockRaiseToSynch(&Thread->ApcQueueLock, &LockHandle);
+    //升到synch_level获取apc锁
+
+    if ((Thread->ApcQueueable == FALSE) || //线程退出时不接受APC
+        (Apc->Inserted == TRUE)) {
+            Inserted = FALSE;
+
+    } else {
+        Apc->Inserted = TRUE;
+        Apc->SystemArgument1 = SystemArgument1;
+        Apc->SystemArgument2 = SystemArgument2;
+        KiInsertQueueApc(Apc, Increment);
+        Inserted = TRUE;
+    }
+
+    //
+    // Unlock the thread APC queue lock, exit the scheduler, and return
+    // whether the APC was inserted.
+    //
+
+    KeReleaseInStackQueuedSpinLockFromDpcLevel(&LockHandle);
+    KiExitDispatcher(LockHandle.OldIrql);
+
+
+KiInsertQueueApc
+{
+        ………….
+            Thread = Apc->Thread;
+        if (Apc->ApcStateIndex == InsertApcEnvironment) { //被插入线程的环境，这里面赋值
+            Apc->ApcStateIndex = Thread->ApcStateIndex;
+        }
+
+        ApcState = Thread->ApcStatePointer[Apc->ApcStateIndex];
+
+        ApcMode = Apc->ApcMode;
+
+        ASSERT (Apc->Inserted == TRUE);
+
+        if (Apc->NormalRoutine != NULL) {
+            if ((ApcMode != KernelMode) && (Apc->KernelRoutine == PsExitSpecialApc)) {//用户模式
+                Thread->ApcState.UserApcPending = TRUE;
+                InsertHeadList(&ApcState->ApcListHead[ApcMode],
+                    &Apc->ApcListEntry);
+
+            } else {//普通内核模式 插入尾部
+                InsertTailList(&ApcState->ApcListHead[ApcMode],
+                    &Apc->ApcListEntry);
+            }
+
+        } else {//特殊内核模式 找到最后一个特殊APC 插入 始终保持特殊APC在普通的前面，又要保证插入是按照时间顺序的。
+            ListEntry = ApcState->ApcListHead[ApcMode].Blink;
+            while (ListEntry != &ApcState->ApcListHead[ApcMode]) {
+                ApcEntry = CONTAINING_RECORD(ListEntry, KAPC, ApcListEntry);
+                if (ApcEntry->NormalRoutine == NULL) {
+                    break;
+                }
+
+                ListEntry = ListEntry->Blink;
+            }
+
+            InsertHeadList(ListEntry, &Apc->ApcListEntry);
+        }
+
+        if (Apc->ApcStateIndex == Thread->ApcStateIndex) {
+            //是线程有的状态环境 0 or 1 原始或者挂靠的环境，另外两种状态已经在之前解决掉了 现在只有这两种。并且当现在状态相同，可以尝试让apc立即执行起来
+
+            //
+            // If the target thread is the current thread, then the thread state
+            // is running and cannot change.
+            //
+
+            if (Thread == KeGetCurrentThread()) {//插入的就是当前线程
+
+                ASSERT(Thread->State == Running);
+
+                //
+                // If the APC mode is kernel, then set kernel APC pending and
+                // request an APC interrupt if special APC's are not disabled.
+                //
+
+                if (ApcMode == KernelMode) {//内核态apc 直接请求apc中断
+                    Thread->ApcState.KernelApcPending = TRUE;
+                    if (Thread->SpecialApcDisable == 0) {
+                        KiRequestSoftwareInterrupt(APC_LEVEL);
+                    }
+                }
+
+                return;
+            }
+
+            RequestInterrupt = FALSE;
+            KiLockDispatcherDatabaseAtSynchLevel();
+            if (ApcMode == KernelMode) {
+
+                Thread->ApcState.KernelApcPending = TRUE;
+                KeMemoryBarrier();
+                ThreadState = Thread->State;
+                if (ThreadState == Running) {//线程正在运行 请求中断
+                    RequestInterrupt = TRUE;
+
+                } else if ((ThreadState == Waiting) && //线程处于等待状态，唤醒这个线程 在KiUnwaitThread调用 KiReadyThread 这里面会交付APC
+                    (Thread->WaitIrql == 0) &&
+                    (Thread->SpecialApcDisable == 0) &&
+                    ((Apc->NormalRoutine == NULL) ||
+                    ((Thread->KernelApcDisable == 0) &&
+                    (Thread->ApcState.KernelApcInProgress == FALSE)))) {
+
+                        KiUnwaitThread(Thread, STATUS_KERNEL_APC, Increment);
+
+                } else if (Thread->State == GateWait) { //门等待 从门等待中拆出来 直接插入备用链表
+                    KiAcquireThreadLock(Thread);
+                    if ((Thread->State == GateWait) &&
+                        (Thread->WaitIrql == 0) &&
+                        (Thread->SpecialApcDisable == 0) &&
+                        ((Apc->NormalRoutine == NULL) ||
+                        ((Thread->KernelApcDisable == 0) &&
+                        (Thread->ApcState.KernelApcInProgress == FALSE)))) {
+
+                            GateObject = Thread->GateObject;
+                            KiAcquireKobjectLock(GateObject);
+                            RemoveEntryList(&Thread->WaitBlock[0].WaitListEntry);
+                            KiReleaseKobjectLock(GateObject);
+                            if ((Queue = Thread->Queue) != NULL) {
+                                Queue->CurrentCount += 1;
+                            }
+
+                            Thread->WaitStatus = STATUS_KERNEL_APC;
+                            KiInsertDeferredReadyList(Thread);
+                    }
+
+                    KiReleaseThreadLock(Thread);
+                }
+
+            } else if ((Thread->State == Waiting) &&
+                (Thread->WaitMode == UserMode) &&
+                (Thread->Alertable || Thread->ApcState.UserApcPending)) {//用户模式 正在等待 并且可以唤醒 调用 KiUnwaitThread
+
+                    Thread->ApcState.UserApcPending = TRUE;
+                    KiUnwaitThread(Thread, STATUS_USER_APC, Increment);
+            }
+            //其他的情况只能等待其他机会执行APC了
+            //
+            // Unlock the dispatcher database and request an APC interrupt if
+            // required.
+            //
+            //如果有请求中断 这里执行一个
+            KiUnlockDispatcherDatabaseFromSynchLevel();
+            if (RequestInterrupt == TRUE) {
+                KiRequestApcInterrupt(Thread->NextProcessor);
+            }
+        }
+
+        return;
+    }
+```
+　　在KeInsertQueueApc 将APC对象存放到目标线程相应的APC队列之前，它首先检查目标线程是否是APC queueable。如果不是，函数立即返回FALSE.如果是，函数直接用参数设置SystemArgument1域和SystemArgument2 域，随后，函数调用KiInsertQueueApc来将APC对象存放到相应的APC队列。
+
+
+　　KiInsertQueueApc 仅仅接受一个APC对象和一个优先级增量。这个函数首先得到线程APC队列的spinlock并且持有它，防止其他线程修改当前线程的APC结构。随后，检查APC对象的Inserted 域。如果是TRUE,表明这个APC对象已经存放到APC队列中了，函数立即返回FALSE.如果APC对象的Inserted 域是FALSE.函数通过ApcStateIndex域来确定目标APC环境，然后把APC对象存放到相应的APC队列中，即将APC对象中的ApcListEntry 域链入到APC环境的ApcListHead域中。链入的位置由APC的类型决定。常规的内核模式APC,用户模式APC都是存放到相应的APC队列的末端。相反的，如果队列中已经存放了一些APC对象，特殊的内核模式APC存放到队列中第一个常规内核模式APC对象的前面。如果是内核定义的一个当线程退出时使用的用户APC,它也会被放在相应的队列的前面。然后，线程的主APC环境中的UserApcPending域杯设置为TRUE。这时KiInsertQueueApc 设置APC对象的Inserted 域为TRUE，表明这个APC对象已经存放到APC队列中了。接下来，检查这个APC对象是否被排队到线程的当前进程上下文APC环境中，如果不是，函数立即返回TRUE。如果这是一个内核模式APC，线程主APC环境中的KernelApcPending域设置为TRUE。
+
+ 
+
+### 3.APC的执行过程分析
+
+　　分成内核模式的APC执行和用户模式的APC执行
+
+　　①我们先看看内核模式的APC
+```cpp
+VOID
+KiDeliverApc (
+    IN KPROCESSOR_MODE PreviousMode,
+    IN PKEXCEPTION_FRAME ExceptionFrame,
+    IN PKTRAP_FRAME TrapFrame
+    )
+{
+
+    PKTHREAD Thread = KeGetCurrentThread();
+    PKPROCESS Process =Thread->ApcState.Process;
+    ...
+    ASSERT_IRQL_EQUAL(APC_LEVEL);
+
+    
+    //更换陷阱帧
+    OldTrapFrame = Thread->TrapFrame;
+    Thread->TrapFrame = TrapFrame;
+
+    //Clear Kernel APC Pending
+    Thread->ApcState.KernelApcPending = FALSE;
+
+    //Check if Special APCs are disabled
+    if (Thread->SpecialApcDisable == 0) {
+
+        //先处理内核模式APC队列中的每一项
+        while (IsListEmpty(&Thread->ApcState.ApcListHead[KernelMode]) == FALSE) {
+           //只处理当前线程当前状态环境下的dpc
+
+            KeAcquireInStackQueuedSpinLock(&Thread->ApcQueueLock, &LockHandle);
+
+            NextEntry = Thread->ApcState.ApcListHead[KernelMode].Flink;
+
+            //Check if the list became empty now
+            if (NextEntry == &Thread->ApcState.ApcListHead[KernelMode]) {//到这已经空了释放并退出
+                KeReleaseInStackQueuedSpinLock(&LockHandle);
+                break;
+            }
+
+            //
+            // Clear kernel APC pending, get the address of the APC object,
+            // and determine the type of APC.
+            //
+            // N.B. Kernel APC pending must be cleared each time the kernel
+            //      APC queue is found to be non-empty.
+            //
+
+            Thread->ApcState.KernelApcPending = FALSE;
+            
+             Apc = CONTAINING_RECORD(NextEntry, KAPC, ApcListEntry);
+            ReadForWriteAccess(Apc);
+            KernelRoutine = Apc->KernelRoutine;
+            NormalRoutine = Apc->NormalRoutine;
+            NormalContext = Apc->NormalContext;
+            SystemArgument1 = Apc->SystemArgument1;
+            SystemArgument2 = Apc->SystemArgument2;
+            
+            if (NormalRoutine == (PKNORMAL_ROUTINE)NULL) 
+            {//没有NormalRoutine  特殊APC
+
+                RemoveEntryList(NextEntry);
+                Apc->Inserted = FALSE;
+                KeReleaseInStackQueuedSpinLock(&LockHandle);
+                        //调用APC
+                (KernelRoutine)(Apc,
+                                &NormalRoutine,
+                                &NormalContext,
+                                &SystemArgument1,
+                                &SystemArgument2);
+  
+
+            } 
+            else 
+            {//普通的内核apc
+   
+   
+                if ((Thread->ApcState.KernelApcInProgress == FALSE) &&
+                   (Thread->KernelApcDisable == 0)) 
+                {
+
+                    RemoveEntryList(NextEntry);
+                    Apc->Inserted = FALSE;
+                    KeReleaseInStackQueuedSpinLock(&LockHandle);
+            (KernelRoutine)(Apc,     //普通的apc 比如nt!KiSuspendThread
+                    &NormalRoutine,   //NormalRoutine可能会在这里被改成0，如果没改成0继续执行
+                    &NormalContext,
+                    &SystemArgument1,
+                    &SystemArgument2);
+
+     //还要调用Normal
+                    if (NormalRoutine != (PKNORMAL_ROUTINE)NULL) {   //比如这可能是是nt!KiSuspendNop 啥也不干直接返回
+                    Thread->ApcState.KernelApcInProgress = TRUE; //在这个apc执行的时候 其他的普通apc不会被交付
+                    KeLowerIrql(0);//这里normal和kernel的irql也不一样，normal在passive运行
+                    (NormalRoutine)(NormalContext,   
+                            SystemArgument1,
+                            SystemArgument2);
+   
+                    KeRaiseIrql(APC_LEVEL, &LockHandle.OldIrql);
+                }
+   
+                Thread->ApcState.KernelApcInProgress = FALSE;
+   
+               } else {
+              KeReleaseInStackQueuedSpinLock(&LockHandle);
+               goto CheckProcess;
+             }
+         }
+    }
+```
+　　DeliveryMode 表示需要投递的哪一种APC，可以是KernelMode，也可以是UserMode，如果是UserMode表示先执行内核模式队列中的APC请求，在执行内核模式队列中的APC请求，如果是KernelMode，表示只执行内核模式队列中的APC请求。
+此外，不管是内核模式还是用户模式，APC请求中一定有KernelRoutine，而NormalRoutine则可能有也可能没有。
+
+　　KTHREAD中有两个KAPC_STATE数据结构，一个是ApcState，另一个是SavedApcState，两者都有APC队列，但是要投递的是ApcState中的队列。
+
+　　内核模式队列中执行APC是一次执行该队列中的所有APC请求，而用户模式队列中执行用户APC却只执行其中的第一项APC请求。
+
+　　所以首先通过一个while循环检查内核模式APC队列，如果NormalRoutine为NULL，这是一种特殊情况，执行KernelRoutine所指的内核函数。如果NormalRoutine非空，那么首先调用的是KernelRoutine，而指针NormalRoutine的地址作为参数传递下去，KernelRoutine的执行可能改变这个指针的值，如果执行KernelRoutine之后NormalRoutine仍然非空，那么调用这个函数，虽然在内核执行，但是在PASSIVE_LEVEL级别上运行的，而不是APC_LEVEL级别。
+
+
+　　②执行完内核APC请求之后，我们再看看DeliveryMode为UserMode的情况
+
+```cpp
+[KideliverApc()]
+             //Now we do the User APCs   
+        if ((PreviousMode == UserMode) &&
+            (IsListEmpty(&Thread->ApcState.ApcListHead[UserMode]) == FALSE) &&
+            (Thread->ApcState.UserApcPending != FALSE)) {
+
+            KeAcquireInStackQueuedSpinLock(&Thread->ApcQueueLock, &LockHandle);
+
+            Thread->ApcState.UserApcPending = FALSE;
+            NextEntry = Thread->ApcState.ApcListHead[UserMode].Flink;
+            if (NextEntry == &Thread->ApcState.ApcListHead[UserMode]) {
+                KeReleaseInStackQueuedSpinLock(&LockHandle);
+                goto CheckProcess;
+            }
+                
+            //获得APC对象
+            Apc = CONTAINING_RECORD(NextEntry, KAPC, ApcListEntry);
+            ReadForWriteAccess(Apc);
+            KernelRoutine = Apc->KernelRoutine;
+            NormalRoutine = Apc->NormalRoutine;
+            NormalContext = Apc->NormalContext;
+            SystemArgument1 = Apc->SystemArgument1;
+            SystemArgument2 = Apc->SystemArgument2;
+            RemoveEntryList(NextEntry);            //从队列中摘下APC请求 
+            Apc->Inserted = FALSE;
+            KeReleaseInStackQueuedSpinLock(&LockHandle);
+            //Call the kernelroutine
+            (KernelRoutine)(Apc,      //用户态时这里很常见的是nt!IopDeallocateApc
+                            &NormalRoutine,  
+                            &NormalContext,
+                            &SystemArgument1,
+                            &SystemArgument2);
+   
+            if (NormalRoutine == (PKNORMAL_ROUTINE)NULL) {
+                //Check if more User APCs are pending
+                KeTestAlertThread(UserMode);
+   
+            } else {
+                   //NormalRoutine 非空，为在用户空间执行APC函数做准备
+                //Set up the Trap Frame and prepare for Execution in NTDLL.DLL
+                KiInitializeUserApc(ExceptionFrame,
+                                    TrapFrame,
+                                    NormalRoutine,
+                                    NormalContext,
+                                    SystemArgument1,
+                                    SystemArgument2);
+            }
+        }
+    }
+```
+　　内核APC的执行时无条件的，只要队列非空就要执行，而用户APC是有条件的。
+
+　　第一用户APC队列非空，第二调用参数DeliveryMode必须是UserMode，也就是即将返回到用户空间，并且ApcState中的UserApcPending为TRUE，表示队列中的请求却是是要求执行的。
+
+ 
+
+　　与内核APC队列相比，用户APC这次进入KiDeliverApc()只处理用户APC队列中的第一个请求。先执行KernelRoutine。
+
+　　如果执行完之后，NormalRoutine为NULL，那么执行KeTestAlertThread()，检测是否还有用户APC请求。
+
+　　如果执行完之后，NormalRoutine不为NULL，那么执行KiInitializeUserApc()，而不是直接调用NormalRoutine，因为用户模式的NormalRoutine是在用户空间，要等cpu回到用户模式时才执行，所以要做一些准备，KiInitializeUserApc()的实参ExceptionFrame和TrapFrame都是从KiServiceExit()传下来的。
+```cpp
+VOID NTAPI
+    KiInitializeUserApc(IN PKEXCEPTION_FRAME ExceptionFrame,
+                        IN PKTRAP_FRAME TrapFrame,IN PKNORMAL_ROUTINE NormalRoutine,
+                        IN PVOID NormalContext,IN PVOID SystemArgument1,IN PVOID SystemArgument2)
+{
+    CONTEXT Context;
+    ....
+    
+    //Don't deliver APCs in V86 mode
+    if(TrapFrame->EFlags&EFLAFGS_V86_MASK)
+        return;
+    
+    //save the full context 将系统空间堆栈上的自陷框架转换成CONTEXT结构
+    Context.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
+    KeTrapFrameToContext(TrapFrame,ExceptionFrame,&Context);
+
+    //Protect with SEH 对用户空间堆栈的操作可能引起异常  ， 如地址错误
+    _SEH_TRY
+    {
+        //Sanity check
+        ASSERT(TrapFrame->SegCs & MODE_MASK)!= KernelMode);
+
+        //Get the aligned size
+        AlignedEsp = Context.Esp &~ 3 ; //保证边界对齐
+        ContextLength = CONTEXT_ALIGNED_SIZE + (4*sizeof(ULONG_PTR));
+        Stack = ((AlignedEsp -8 )&~3)- ContextLength; //调整用户空间堆栈指针
+
+        //Probe the stack
+        ProbeForWrite((PVOID)Stack,AlignedEsp-Stack,1);
+        ASSERT(!Stack&3);
+
+        //Copy data into it 将Context构复制到用户空间堆栈
+        RtlCooyMemory((PVOID)(Stack + (4*sizeof(ULONG_PTR))),&CONTEXT,sizeof(CONTEXT));
+
+        //修改系统空间上的自陷框架
+        TrapFrame->Eip = (ULONG)KeUserApcDispatcher;  //用户空间的EIP
+        TrapFrame->HardwareEsp = Stack ;              //用户空间堆栈位置已有变化
+
+        //Set R3 State
+        TrapFrame->SegCs = Ke386SanitizeSeg(KGDT_R3_CODE,UserMode);
+        TrapFrame->HardwareSegSs = Ke386SanitizeSeg(KGDT_R3_DATA,UserMode);
+        TrapFrame->SegDs = Ke386SanitizeSeg(KGDT_R3_DATA,UserMode);
+        TrapFrame->SegEs = Ke386SanitizeSeg(KGDT_R3_DATA,UserMode);
+        TrapFrame->Fs = Ke386SanitizeSeg(KGDT_R3_TEB,UserMode);
+        TrapFrame->SegGs = 0;
+
+        //Sanitize EFLAGS
+        TrapFrame->EFlags = Ke386SanitizeFlags(Context.EFlags,UserMode);
+
+        //check if thread has IOPL and force it enabled if so
+        if(KeGetCurrentThread()->Iopl)
+            TrapFrame->EFlags|= 0x3000;
+
+        //修改用户空间堆栈
+        *(PULONG_PTR)(Stack + 0* sizeof(ULONG_PTR)) = (ULONG_PTR)NormalRoutine;
+        *(PULONG_PTR)(Stack + 1* sizeof(ULONG_PTR)) = (ULONG_PTR)NormalContext;
+        *(PULONG_PTR)(Stack + 2* sizeof(ULONG_PTR)) = (ULONG_PTR)SystemArgument1;
+        *(PULONG_PTR)(Stack + 3* sizeof(ULONG_PTR)) = (ULONG_PTR)SystemArgument2;
+    }
+    _SEH_EXCEP(KiCopyInformation2)
+    {
+        //如果在上面受保护的操作中发生异常
+        _SEH_VAR(SehExcepRecord).ExceptionAddress = (PVOID)TrapFrame->Eip;
+        KiDispatchException(&SehExceptRecord,ExceptionFrame,TrapFrame,UserMode,TRUE);
+    }
+}
+```
+　　①首先CPU进入内核，在内核的堆栈上就会有一个框架，用来保存用户空间的现场，因进入内核的原因不同，这个框架可以被称为自陷框架、中断框架、异常框架，不管什么框架，器内容格式是一样的，CPIU在返回用户空间时将用到这个框架内容，保证CPU能正确的返回原先的断点。
+
+　　②既然要让CPU返回用户空间时先执行我们的apc函数，就要修改这个框架内容，还要在执行完成之后回到之前的断点，所以这里首先将框架原来的内容保存起来，等执行完成之后在重入内核时恢复。但是保存在哪里呢？保存在当前线程的用户空间堆栈上是最合理的，需要把框架上内容复制到一个数据结构上，数据结构在保存在用户空间堆栈上，这个数据结构就是CONTEXT结构。
+
+　　③CPU在执行完成APC函数之后，需要执行一个系统调用NtContinue()，并将指向用户空间堆栈上的CONTEXT结构作为参数，这样就可以还原到原先的断点。
+
+
+　　这个函数代码分成三部分，第一部分通过KeTrapFrameToContext()将此时的自陷框架内容复制在Context中，第二部分将Context复制到用户空间堆栈上，在加上四个32位整数的位置，分别是NormalRoutine、NormalContext、SystemArgument1和SystemArgument2。第三部分修改当前自陷框架的内容，将EIP指向用户空间的KiUserApcDispatcher()，修改ESP。
+
+　　KiUserApcDispatcher是由ntdll.dll提供的函数，负责调用NormalRoutine和NtContinue函数。
+
+　　在NormalRoutine(门户函数)函数中调用我们的NormalContext(我们真正认为的APC函数)函数
+
+　　这里差不多就完成了整个分析
+
+ 
+
+## 0x05   用户APC插入
+
+　　在用户APC设置的时候，调用QueueUserAPC函数，pfnAPC就是我们要执行的函数，hThread就是目标线程句柄，daData就是目标进程空间中的一块数据，是作为pfnAPC的参数
+
+```cpp
+QueueUserAPC(PAPCFUNC pfnAPC,HANDLE hThread,ULONG_PTR dwData)
+{
+　　NtQueueApcThread(hThread,IntCallUserApc,pfnAPC,(PVOID)dwData,NULL);
+}
+```
+ 　　这里我们要执行的函数变成了NormalContext传递过去，系统执行的NormalRoutine却变成了IntCallUserApc函数
+
+这里IntCallUserApc函数相当于门户函数，在里面直接调用了NormalContext也就是我们的pfnAPC函数。
+
+```cpp
+NTSTATUS NTAPI
+NtQueueApcThread(HANDLE ThreadHandle, PKNORMAL_ROUTINE ApcRoutine,
+                 PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2)
+{
+    KeInitializeApc(Apc,&Thread->Tcb,OriginalApcEnvironment,
+                       PspQueueApcSpecialApc,NULL,ApcRoutine,UserMode,NormalContext);
+    KeInsertQueueApc(Apc,SystemArgument1,SystemArgument2,IO_NO-INCREMENT)
+}
+```
+
+　　这里PspQueueApcSpecialApc做为KernelRoutine初始化APC,传入的IntCallUserApc函数作为NormalRoutinue。
+　　pfnAPC作为NormalContext，dwData作为SystemArgument1
+
+ 
+
+## 0x06   APC的调用时机
+
+　　内核代码离开临界区或守护区，调用KiCheckForKernelApcDelivery或者请求APC级别中断
+
+　　KiSwapThread返回以前调用一次KiDeliverApc
+
+　　从系统服务或者异常返回时 调用KiDeliverApc 设置用户态apc的交付
+
+　　APC_LEVEL的中断和irql降到passive时KiDeliverApc都会被调用

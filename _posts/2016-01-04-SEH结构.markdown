@@ -1,0 +1,259 @@
+---
+layout: post
+title: SEH结构
+date: 2016-01-04 16:20:12 +0900
+category: windowsDebug
+---
+
+**首先有几点问题**
+
+**1.在后文中看到的PE的节中的配置信息表Load configuration是对SEH回调函数的注册，那么Exception Table是加载的什么信息。**
+
+**2.什么时候走进系统异常，什么时候走进自己注册的异常回调函数。**
+
+摘自 《加密与解密》和《Windows PE权威指南》
+
+## 0x01 Windows结构化异常处理
+　　结构化异常处理是Windows OS处理程序错误或异常的技术。
+
+　　SEH是系统发现异常或错误时，在终结应用程序之前给应用程序的一个最后改正错误的机会，就是系统给终结程序之前给程序的一个执行其与设定的回调函数的机会。
+
+　　由于SEH使用了与硬件平台相关的数据指针，所以在不同的硬件平台上，SEH的实现方法是不同的。X86平台上的SEH处理框架中，把异常分为两类
+* 硬异常
+* 软异常
+
+##### 硬异常
+1. 因执行指令失败引起的故障(Fault)异常，比如除以0，以及eip指向不可执行的页面。
+2. 执行了自陷指令的陷阱(Trap)异常，比如int 3指令。
+3. 无法恢复的严重出错，终止(Abort)异常，比如硬件故障引发的异常，或者系统表中出现了错误值引发的异常。
+
+##### 软异常
+　　就是一函数调用的手段来模拟一次异常，即通过windows提供的API函数RaiseException，执行函数引发软异常。
+
+```cpp
+    VOID RasieException(
+       DWORD  dwExceptionCode,        //标识所引发异常的代码
+       DWORD  dwExceotionFlags,       //异常继续是否执行的标识
+       DWORD  nNumberOfArguments,     //参数个数
+       CONST DWORD *lpArguments       //指向参数缓冲区的指针
+    )
+```
+
+## 0x02 用户模式下的异常处理
+　　用户模式设计到了几个关键的数据结构。
+
+　　TEB(Thread Environment Block，线程环境块)在windows 9x系列中称为TIB，它记录着现成的重要信息，每一个线程都对应着一个TEB结构，在windows 2000 DDK中定义为
+```cpp
+typedef struct _NT_TIB{    
+	struct _EXCEPTION_REGISTRATION_RECORD *ExceptionList; //指向SEH链入口
+    PVOID StackBase;            //基址地址
+    PVOID StackLimit;           //栈大小
+    PVOID SubSystemTib;
+    Union{        
+		PVOID FiberData;        
+		ULONG Version;    
+	};    
+	PVOID ArbitraryUserPotiner;    
+	struct _NT_TIB *Self;       //NIT_TIB结构自身的线性地址
+}NT_TIB;
+```
+其中ExceptionList指向一个EXCEPTION_REGISTRATION结构，该结构定义为
+```cpp
+EXCEPTION_REGISTRATION struc
+    prev      dd  ?     ;指向前一个EXCEPTION_REGISTRATION结构的指针   
+    handler   dd  ?     ;当前异常处理回调函数地址
+ EXCEPTION_REGISTRATION ends
+```
+　　与异常处理相关的项是指向EXCEPTION_REGISTRATION结构的指针ExceptionList，正好位于TEB的偏移0处。Windows创建线程时，OS会为每个线程分配TEB，而且都将FS段选择器指向当前线程的TEB数据，这就为程序提供了存取TEB数据的途径，即TEB总是有[FS:0]指向。
+
+　　当异常发生时，系统从NT_TIB中取出第一个字段，然后依据该字段获取第一个异常处理程序句柄Handler，并根据其中的地址调用该回调函数。
+
+　　异常发生在用户空间，在内核中的异常处理程序就会由内核态函数KiKernelTrapHandler改变为用户态函数KiUserTrapHandler。该函数构造异常记录块，然后转交给函数KiDispatchException来处理。用户模式下只有一个类似于内核空间的KiDispatchException函数，它就是动态链接库ntdll.dll中的KiUserExceptionDispatcher，它是用户模式下SEH异常处理的总入口。
+```cpp
+KiUserTrapHandler(
+    PKTRAP_FRAME Tf,
+    ULONG ExceptionNr,
+    PVOID Cr2
+)
+```
+```cpp
+KiDispatchException(
+    PEXCEPTION_RECORD ExceptionRecord,   //指向ExceptionRecord指针
+    PKEXCEPTION_FRAME ExceptionFrame,    //对x86 为NULL
+    PKTRAP_FRAME TrapFrame,              //陷阱框架指针
+    KPROCESSOR_MODE PreviousMode,        //模式
+    BOOLEAN FirstChance                  //是否为进行的第一次努力
+)
+```
+　　可是，尽管是发生于用户空间的异常，对异常的初期响应和处理毕竟是在内核中，现在的目的就是要从内核中的KiDispatchException()启动用户空间这个函数的执行。
+
+　　对于内核中的KiDispatchException()，这就是针对用户空间异常的主要操作。不过具体的实现还要再复杂一些，就像针对系统空间异常一样，内核中涉及用户空间异常的处理也分三步：
+
+　　第一步、参数FirstChance为1时，先通过KdpEnterDebuggerException()交由内核调试程序(Kernel Debugger)处理。如果内核调试程序解决了问题、或者认为无需提交用户空间，则返回值就是kdContinue，这就行了。否则就要把异常提交给用户空间，由用户空间的程序加以处理。
+
+　　第二步、然而，万一用户空间处理不了，例如ExceptionList中没有安排下可以认领、处理本次异常的节点，就会通过RtlRaiseException()、从而通过系统调用ZwRaiseException()发起一次“软异常”(见后)，把问题交还内核。此时CPU再次进入KiDispatchException()，但是此时的实际参数FirstChance为0，所以直接进入第二步措施。在Windows内核中，这第二次努力是通过进程间通信向用户空间的调试程序(Debugger)发送一个报文、将其唤醒，由调试程序作进一步的处理。例如，对于由用户空间调试程序设置的断点(INT3)，就只能由用户空间调试程序加以处理。不过，在ReactOS 0.3.0版的代码中这一步尚未实现，所以这里有个注释说：“FIXME: Forward the exception to the debugger for 2nd chance”。
+
+　　第三步、如果用户空间调试程序不存在，或者也不能解决，那就属于不可恢复的问题了。于是就有第三步措施，那就是通过ZwTerminateThread()结束当前线程的运行。正常情况下针对当前线程本身的ZwTerminateThread()是不返回的；而倘若竟然返回了，那对于整个系统都是不可恢复的问题了，所以通过宏操作KEBUGCHECKWITHTF()显示出错信息、转储(Dump)当时的内存映像，并进入一个Ke386HaltProcessor()的无限循环。换言之，整个系统就“死”了。
+
+ 
+
+　　显然，这里最关键的一步、也是最有希望的一步，是把异常提交给用户空间。怎么提交呢？首先要把上下文数据结构Context和异常纪录块ExceptionRecord拷贝到用户空间堆栈上去，再在用户空间堆栈上安上两个指针，分别指向这两个数据结构的用户空间副本，并相应调整异常框架中的用户空间堆栈指针。下面就会看到，这两个指针将被用作用户空间的函数调用参数。
+
+　　最后、也是最关键的，则是把异常框架中的用户空间返回地址设置成函数指针KeUserExceptionDispatcher所指向的函数。顺利完成了这些准备以后，就把局部量UserDispatch设成1，因此紧接着就从本次异常处理返回了。当然，这是返回到了指针KeUserExceptionDispatcher所指向的函数中。已经熟悉APC机制的读者应该很容易由此联想到对用户空间APC函数的调用。事实上也确实非常相似，如果说APC相当于对用户空间软件的中断机制，则异常的提交就相当于对用户空间软件的异常机制。
+
+　　当CPU从异常返回，回到用户空间时，就进入了函数KiUserExceptionDispatcher，该函数就是用户模式下的异常响应/处理程序入口。
+
+　　下面是KiUserExceptionDispatcher的调用过程：
+```cpp
+KiUserExceptionDispatcher()
+  RtlDispatchException()   //(对ExceptionList扫描处理)  该函数位于KiDispatchException中
+     RtlpIsValidHandler()              //异常处理函数指针安全验证
+     RtlpExecuteHandlerForException(); //尝试处理异常
+     ExecuteHandler()
+```
+```cpp
+RtlDispatchException(
+IN PEXCEPTION_RECORD ExceptionRecord,  //EXCEPTION_RECORD结构
+IN PCONTEXT Context                    //CONTEXT结构
+)
+```
+　　当异常发生时,OS向引起异常的现成的堆栈里压入EXCEPTION_POINTERS结构，此结构包含两个指针，一个指向EXCEPTION_RECORD，一个指向CONTEXT结构
+```cpp
+typedef struct _EXCEPTION_POINTERS{
+    EXCEPTION_RECORD ExceptionRecord DWORD ? //指向EXCEPTION_RECORD结构
+    CONTEXT  ContextRecord           DWORD ? //指向CONTEXT结构
+}
+```
+　　其中EXCEPTION_RECORD结构
+```cpp
+EXCEPTION_RECORD STRUCT{
+     DWORD ExceptionCode    ;异常代码 
+     DWORD ExceptionFlags   ;异常标志
+     Struct       EXCEPTION_RECORD ;指向另外一个EXCEPTION_RECORD的指针
+     PVOID  ExceptionAddress ;异常发生的地址
+     DWORD NumberParameters  ;下面ExceptionInformation所含有的dword数目
+     ULONG_PTR ExceptionInformation[EXCEPTION_MAXIMUM_PARAMETERS]
+}EXCEPTION_RECORD ENDS
+```
+　　ExceptionCode字段定义了产生异常的原因，也可以自定义ExceptionCode
+
+　　CONTEXT结构是Win32 API一个几乎唯一与处理器结构相关的结构，包括了线程运行时处理器各主要寄存器的完整镜像，用于保存线程运行时环境。
+
+## 0x03 内核模式下的异常处理
+　　内核模式下，fs[0x00]也是一个异常处理链表的指针，KPCR结构中的第一个成分是KPCR_TIB数据结构，ExceptionList则是KPCR_TIB结构中的第一个字段，以下是定义
+```cpp
+Typedef struct _KPCR_TIB{
+     PVOID ExceptionList,
+     PVOID StackBase,
+     PVOID StackLimit,
+     PVOID SubSystemTib,
+     _ANONYMOUS_UNION union
+     {
+        PVOID FiberData,
+        DWORD Version
+     }DUMMYUNIONNAME
+     PVOID ArbitraryUserPointer,
+     Struct _NT_TIB *Self 
+}
+```
+```cpp
+Typedef struct _EXCEPTION_REGISTRATION_RECORD
+{
+    Struct _EXCEPTION_REGISTRATION_RECORD *Next,
+    PEXCEPTION_ROUTINE Handler      //SEH异常处理毁掉函数指针
+}
+```
+　　认为_KiTrapHandler是公共的异常处理函数，是因为大部分异常处理都是把它当成内核异常的入口，也有例外，比如14号异常(页异常)，该异常的处理入口为函数_KiPageFaultHandler。公共的异常处理函数最终会根据CPU在发生异常时所处的地址空间而定，用户层调用函数_KiUserTrapHandler。如果是内核层，调用_KiKernelTrapHandler。
+
+　　下面是内核函数_KiUserTrapHandler的代码
+```cpp
+ULONG
+KiKernelTrapHandler(PKTRAP_FRAME Tf,ULONG ExceptionNr,PVOID Cr2)
+{
+    EXCEPTION_RECORD Er;
+    Er.ExceptionFlags = 0;
+    Er.ExceptionRecord = NULL;
+    Er.ExceptionAddress  = (PVOID)Tf->Eip;
+
+    If(ExceptionNr ==14)   //页异常需要单独处理
+    {
+        Er.ExceptionCode = STATUS_ACCESS_VIOLATION;
+        Er.NumberParameters = 2;
+        Er.ExceptionInformation[0] = Tf->ErrCode & 0x1;
+        Er.ExceptionInformation[1] = (ULONG)Cr2;
+    }
+    else
+    {
+
+        If(ExceptionNr<ARRAY_SIZE(ExceptionToNtStatus))
+        {
+            Er.ExceptionCode = ExceptionToNtStatus[ExceptionNr];
+        }
+        else
+        {
+            Er.ExceptionCode = STATUS_ACCESS_VIOLATION;
+        }
+        Er.NumberParameters = 0;
+    }
+    Er.ExceptionFlags  = 0;
+    KiDispatchException(&Er,NULL,Tf,KernelMode,TRUE);
+    return (0);
+}
+```
+　　该函数构造了异常记录块EXCEPTION_RECORD，然后调用KiDispatchException
+```cpp
+EXCEPTION_RECORD STRUCT{
+    DWORD ExceptionCode     ;异常代码 
+    DWORD ExceptionFlags    ;异常标志
+    Struct       EXCEPTION_RECORD ;指向另外一个EXCEPTION_RECORD的指针
+    PVOID  ExceptionAddress ;异常发生的地址
+    DWORD NumberParameters  ;下面ExceptionInformation所含有的dword数目
+    ULONG_PTR ExceptionInformation[EXCEPTION_MAXIMUM_PARAMETERS]
+}EXCEPTION_RECORD ENDS
+```
+　　KiDispatchException函数原型为
+```cpp
+NTAPI
+
+KiDispatchException(
+    PEXCEPTION_RECORD ExceptionRecord,   //指向ExceptionRecord指针
+    PKEXCEPTION)FRAME ExceptionFrame,    //对x86  NULL
+    PKTRAP_FRAME  TrapFrame,             //陷阱框架指针
+    KPROCESSOR_MODE      PreviousMode,   //用户模式还是内核模式
+    BOOLEAN FirstChance                  //是否为进行的第一次
+)
+```
+　　该函数既是内核模式下异常处理最后调用函数，也是用户模式下异常处理函数KiUserTrapHandler最后调用的函数。
+
+　　①第一次尝试，FirstChance=1，异常会先提交给调试程序，如果调试程序不存在或调试程序也不能解决该异常，就调用函数RtlDispatchException进行实质性的SEH处理。
+
+　　②SEH对应有三种可能，A如果异常被某个SEH框架接受，并实施长程跳转(Handler回调函数),程序就不用返回，B如果异常被某个SEH框架接受，但是程序认为对该异常只需执行善后函数，这样程序就会从RtlDispatchException(对ExceptionList扫描处理)返回，返回值为true。C异常被所有SEH框架都拒绝接受，第一次失败。
+
+　　③第二次和第一次尝试失败后，程序再次提交给调试程序，通过调用其他的调试支持判断是否可以处理该异常，如果成功，返回常数KdContinue，否则第三次尝试
+
+ 　　第三次尝试表示系统已经没有办法处理故障，系统会显示出错信息，并且将出错信息转储到文件中。
+
+ 
+
+　　SEH处理核心就是对ExceptionList(异常处理链表)的扫描处理，由函数RtlDispatchException完成，此函数的调用位于函数KiDispatchException中。
+
+　　内核模式下异常处理调用关系如下
+```cpp
+ _KiTrapHandler
+   _KiKernelTrapHandler
+     _KiDispatchException           //三次尝试
+       _RtlDispatchException        //对ExceptionList扫描处理
+         _RtlpGetExceptionList
+           _RtlpExecuteHandlerForException  //尝试循环执行异常处理   
+```
+## 0x04 PE中加载配置信息
+```cpp
+IMAGE_LOAD_CONFIG_DIRECTORY STRUCT
+   Characteristics  dd           ?  ;加载配置属性，一般为48h
+   TimeDateStamp    dd           ?  ;时间戳
+   MagorVersion     dw
+   MinorVersion     dw
+   ..
+IMAGE_LOAD_CONFIG_DIRECTORY ENDS
+```
+　　加载配置信息中首先注册源代码中定义的安全SEH回调函数

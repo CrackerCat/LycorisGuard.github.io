@@ -1,0 +1,504 @@
+---
+layout: post
+title: 简易调试器的实现(一)
+date: 2016-03-30 00:58:12 +0900
+category: windowsDebug
+---
+## 一、前言
+　　看过SEH结构化异常处理，看了<软件调试>这本书，觉得调试真是一件特别棒的事情，于是在网上搜索调试器怎么做，前人种树，后人庇荫。
+
+ 　　程序为MFC界面，VS2010开发
+## 二、实现思路
+　　1.调试对象为windows下32位程序，故对于PE文件判断是否符合
+
+　　2.创建被调试进程，传入DEBUG_ONLY_THIS_PROCESS值，使用WaitForDebugEvent等待调试事件发生，使用ContinueDebugEvent继续执行
+
+　　3.使用GetThreadContext读取寄存器值，使用SetThreadContext写入寄存器值
+
+　　4.使用ReadProcessMemory和WriteProcessMemory读取和写入子进程内存，比如cc断点
+
+## 三、代码实现
+　　### 1.判断PE文件
+
+　　将MFC属性设置为可拖入文件，加入消息函数。
+```cpp
+void CDebugger1Dlg::OnDropFiles(HDROP hDropInfo)
+{
+    DragQueryFile(hDropInfo,0,m_FilePath,MAX_PATH);//取得第一个文件的路径
+
+    //拷贝文件到内存中
+    if(LoadFileData(m_FilePath,&m_szFileData,&m_ulLow)==FALSE)
+    {
+        free(m_szFileData);
+        return ;
+    }
+    if(IsPEFile(m_szFileData,&PeType)==FALSE)
+    {
+        MessageBox(L"不是PE文件",L"PECheck",0);
+
+        return;
+    }
+    if(PeType==PE)
+    {
+        MessageBox(L"32位 MZ",L"MZ");   
+　　　//这里后面创建进程
+　　　　// ULONG OepRVA = GetOEP(m_szFileData);
+　　　　//    ULONG Base = GetBase(m_szFileData);
+　　　　//    OEP = (ULONG_PTR)OepRVA + (ULONG_PTR)Base; //获得进程OEP 之前想在OEP设断，
+　　　　//结果根本不会再这段下来，所以在进程创建事件到达的时候，对于结构体中的pInfo->lpStartAddress设置断点
+
+ 
+
+    }
+    else if(PeType==PE64)
+    {
+        MessageBox(L"64位 MZ",L"MZ");  
+        CDialog::OnDropFiles(hDropInfo);
+    }
+    else if(PeType==Unkonw)
+    {
+        MessageBox(L"未知",L"MZ");  
+        CDialog::OnDropFiles(hDropInfo);
+    }
+}
+```
+　　这部分根据PE结构判断PE文件是否合法，目前只支持exe文件，本来想在OEP设置断点的，结果根本断不下来，最后通过创建事件到达的lpStartAddr设置的断点，这里可以查阅一下程序最开始从哪里执行的？肯定不是OEP
+
+ 
+
+
+　　### 2.以调试模式创建子进程
+
+　　Windows有一个调试子系统,所有的异常(包括CPU产生的异常)都会中断到调试子系统中,进程产生异常后,调试子系统会捕捉到这个异常,如果这个进程是以被调试状态创建,那么,调试子系统会将这个异常派发到产生异常的进程的父进程.
+
+　　Windows中，父进程创建子进程，传入DEBUG_ONLY_THIS_PROCESS，这样设置之后，子进程发生的异常会首先通知给父进程处理
+
+```cpp
+STARTUPINFO stcStartupInfo = { sizeof(STARTUPINFO) };
+PROCESS_INFORMATION stcProcInfo = { 0 }; // 进程信息
+
+if (!CreateProcess( /* 创建调试线程 */
+    pStc->path, // 可执行模块路径
+    NULL, // 命令行
+    NULL, // 安全描述符
+    NULL, // 线程属性是否可继承
+    FALSE, // 否从调用进程处继承了句柄
+    DEBUG_ONLY_THIS_PROCESS, // 以“只”调试的方式启动
+    NULL, // 新进程的环境块
+    NULL, // 新进程的当前工作路径（当前目录）
+    &stcStartupInfo, // 指定进程的主窗口特性
+    &stcProcInfo)) // 接收新进程的识别信息
+{
+    //Fail
+    return 1;
+}
+```
+　　如果其父进程的代码用有函数WaitForDebugEvent(),那么,函数将会从等待状态中被唤醒,返回到其父进程的调用地点.并将异常信息保存到DEBUG_EVENT结构体中.
+```cpp
+while (WaitForDebugEvent(&debugEvent, INFINITE) == TRUE) {
+
+if (DispatchDebugEvent(&debugEvent) == TRUE) {  //我们自己的处理函数
+
+    ContinueDebugEvent(g_processID, g_threadID, DBG_EXCEPTION_NOT_HANDLED);
+}
+```
+　　用一个调试事件，用于等待子进程调试事件的到达
+　　如果ContinueDebugEvent第三个参数传递DBG_CONTINUE则表示调试器已经处理了该异常
+　　如果传递DBG_EXCEPTION_NOT_HANDLED，则表示调试器没有处理异常，交给内核处理器处理，内核处理器没有处理则在次交给调试器处理。
+
+　　DEBUG_EVENT结构体为
+```cpp
+typedef struct _DEBUG_EVENT{
+  DWORD dwDebugEventCode;//发生异常的是什么事
+  DWORD dwProcessId;//触发异常的进程ID(如果被调试进程有多个进程,这个ID有可能是其子进程的)
+  DWORD dwThreadId;//触发异常的线程ID(如果被调试进程有多个线程,这个ID有可能是其中的一个线程的
+  union{
+    EXCEPTION_DEBUG_INFOException;//异常类型信息
+    CREATE_THREAD_DEBUG_INFO CreateThread;//创建线程时得到的信息结构体(有可能会创建多个线程)
+    CREATE_PROCESS_DEBUG_INFO CreateProcessInfo;//创建进程时得到的信息结构体,有可能会得到多个
+    EXIT_THREAD_DEBUG_INFO ExitThread;//线程退出的信息结构体
+    EXIT_PROCESS_DEBUG_INFO ExitProcess;//进程退出的信息结构体
+    LOAD_DLL_DEBUG_INFO LoadDll;//加载模块的信息结构体
+    UNLOAD_DLL_DEBUG_INFO UnloadDll;//卸载模块的信息结构体
+    OUTPUT_DEBUG_STRING_INFO DebugString;//输出调试字串的信息结构体
+    RIP_INFOR ipInfo;//系统调试错误时的信息结构体
+  }u;//这是一个联合体,dwDebugEventCode 决定联合体中哪个字段是有用的.
+}DEBUG_EVENT,*LPDEBUG_EVENT;
+```
+　　我们的处理函数是对于DEBUG_EVENT中的调试事件类型的分派
+```cpp
+//根据调试事件的类型调用不同的处理函数。
+BOOL DispatchDebugEvent(const DEBUG_EVENT* pDebugEvent) {
+
+    switch (pDebugEvent->dwDebugEventCode) {
+
+    case CREATE_PROCESS_DEBUG_EVENT:
+        return OnProcessCreated(&pDebugEvent->u.CreateProcessInfo);
+
+    case CREATE_THREAD_DEBUG_EVENT:
+        return OnThreadCreated(&pDebugEvent->u.CreateThread);
+
+    case EXCEPTION_DEBUG_EVENT:
+        return OnException(&pDebugEvent->u.Exception);
+
+    case EXIT_PROCESS_DEBUG_EVENT:
+        return OnProcessExited(&pDebugEvent->u.ExitProcess);
+
+    case EXIT_THREAD_DEBUG_EVENT:
+        return OnThreadExited(&pDebugEvent->u.ExitThread);
+
+    case LOAD_DLL_DEBUG_EVENT:
+        return OnDllLoaded(&pDebugEvent->u.LoadDll);
+
+    case OUTPUT_DEBUG_STRING_EVENT:
+        return OnOutputDebugString(&pDebugEvent->u.DebugString);
+
+    case RIP_EVENT:
+        return OnRipEvent(&pDebugEvent->u.RipInfo);
+
+    case UNLOAD_DLL_DEBUG_EVENT:
+        return OnDllUnloaded(&pDebugEvent->u.UnloadDll);
+
+    default:
+        return FALSE;
+    }
+}
+```
+　　这里我们主要关心的是进程创建和异常到达
+```cpp
+//对于创建进程的调试事件
+BOOL OnProcessCreated(const CREATE_PROCESS_DEBUG_INFO* pInfo) {
+
+    InitializeBreakPointHelper(); //初始化断点列表
+
+    //初始化符号处理器
+    InitSymbol();
+
+    //在程序入口设置断点
+    SetCCBreakPointAt((SIZE_T)pInfo->lpStartAddress,TRUE);
+    IsWow64Process(g_hProcess,&m_bIs32bitProcess);
+    CloseHandle(pInfo->hFile);
+    return TRUE;
+}
+```
+　　其中，lpStartAddress为程序的入口点，我们对此处设置断点，可以让程序断下来。
+
+　　异常处理，是对于EXCEPTION_DEBUG_EVENT事件的处理，包括程序的各种异常
+```cpp
+//发生异常的时候应该通知用户，交由用户来处理，所以应返回FALSE。
+BOOL OnException(const EXCEPTION_DEBUG_INFO* pInfo) {
+
+    switch (pInfo->ExceptionRecord.ExceptionCode) {
+
+    case EXCEPTION_ACCESS_VIOLATION:      // 非法访问异常
+        {
+            break;
+        }    
+    case EXCEPTION_DATATYPE_MISALIGNMENT: // 内存对齐异常
+        {    
+            break;
+        }
+    case EXCEPTION_ILLEGAL_INSTRUCTION:   // 无效指令
+        {    
+            break;
+        }
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:    // 除0错误
+        {    
+            break;
+        }
+    case EXCEPTION_PRIV_INSTRUCTION:      // 指令不支持当前模式
+        {    
+            break;
+        }
+    case EXCEPTION_BREAKPOINT:
+        {
+            /*OnShowSourceLines();*/
+            OnDump(0);
+            ShowAsm(20);
+            return OnSoftBreakPoint(pInfo);   //return false 则中断停下来
+        }
+
+    case EXCEPTION_SINGLE_STEP:  //TF断点
+        {
+            ShowAsm(20);
+            /*OnShowSourceLines();*/
+            OnDump(0);
+            return OnSingleStep(pInfo);
+        }
+    }
+
+    CString strStatusMsg;
+    strStatusMsg.Format(L"First Chance: Exception at %p",(DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+    MainDlg->m_wndStatusBar.SetPaneText(0,strStatusMsg);//在状态条上显示文字
+    g_debuggeeStatus = STATUS_INTERRUPTED;
+    return FALSE;
+}
+
+//这里暂时只处理了EXCEPTION_BREAKPOINT和EXCEPTION_SINGLE_STEP类型的异常
+```
+　　### 3、使用GetThreadContext/SetThreadContext获得寄存器信息
+
+　　每个线程都有一个上下文环境，它包含了有关线程的大部分信息，例如线程栈的地址，线程当前正在执行的指令地址等。上下文环境保存在寄存器中，系统进行线程调度的时候会发生上下文切换，实际上就是将一个线程的上下文环境保存到内存中，然后将另一个线程的上下文环境装入寄存器。
+
+　　我们来看下Context结构，每个Context包含了线程的一些信息
+```cpp
+typedef struct _CONTEXT {
+
+    DWORD ContextFlags;
+    DWORD   Dr0;
+    DWORD   Dr1;
+    DWORD   Dr2;
+    DWORD   Dr3;
+    DWORD   Dr6;
+    DWORD   Dr7;
+    FLOATING_SAVE_AREA FloatSave;
+    DWORD   SegGs;
+    DWORD   SegFs;
+    DWORD   SegEs;
+    DWORD   SegDs;
+    DWORD   Edi;
+    DWORD   Esi;
+    DWORD   Ebx;    
+    DWORD   Edx;
+    DWORD   Ecx;
+    DWORD   Eax;
+    DWORD   Ebp;    //栈底
+    DWORD   Eip;     //下一条执行指令
+    DWORD   SegCs;              // MUST BE SANITIZED
+    DWORD   EFlags;             // MUST BE SANITIZED
+    DWORD   Esp;   //栈顶
+    DWORD   SegSs;  //SS
+    BYTE    ExtendedRegisters[MAXIMUM_SUPPORTED_EXTENSION];
+
+} CONTEXT;
+```
+　　感兴趣的可以研究下线程切换、异常的内核处理过程等研究Context的作用。
+
+ 
+
+　　获取某个线程的上下文环境需要使用GetThreadContext函数，该函数声明如下：
+```cpp
+BOOL WINAPI GetThreadContext(
+     HANDLE hThread,
+     LPCONTEXT lpContext
+ );
+```
+　　第一个参数是线程的句柄，第二个参数是指向CONTEXT结构的指针。要注意，调用该函数之前需要设置CONTEXT结构的ContextFlags字段，指明你想要获取哪部分寄存器的值。该字段的取值如下：
+
+| CONTEXT_CONTROL |   获取EBP，EIP，CS，EFLAGS，ESP和SS寄存器的值。|
+| ------------ | ------------ |
+| CONTEXT_INTEGER |   获取EAX，EBX，ECX，EDX，ESI和EDI寄存器的值。|
+| CONTEXT_SEGMENTS  | 获取DS，ES，FS和GS寄存器的值。  |
+| CONTEXT_FLOATING_POINT  |  获取有关浮点数寄存器的值。 |
+| CONTEXT_DEBUG_REGISTERS | 获取DR0，DR1，DR2，DR3，DR6，DR7寄存器的值。  |
+| CONTEXT_FULL |  等于CONTEXT_CONTROL + CONTEXT_INTEGER + CONTEXT_SEGMENTS |
+
+　　调用GetThreadContext函数之后，CONTEXT结构相应的字段就会被赋值，此时就可以输出各个寄存器的值了。
+
+ 
+
+　　对于其它寄存器来说，直接输出它的值就可以了，但是EFLAGS寄存器的输出比较麻烦，因为它的每一位代表不同的含义，我们需要将这些含义也输出来。一般情况下我们只需要了解以下标志：
+
+|  标志 |  位 | 含义 |
+| ------------ | ------------ | ------------ |
+|  CF |  0 | 进位标志。无符号数发生溢出时，该标志为1，否则为0。 |
+|  PF |  2 | 奇偶标志。运算结果的最低字节中包含偶数个1时，该标志为1，否则为0。 |
+|  AF |  4 | 辅助进位标志。运算结果的最低字节的第三位向高位进位时，该标志为1，否则为0。|
+|  ZF |  6 | 0标志。运算结果未0时，该标志为1，否则为0。 |
+|  SF |  7 | 符号标志。运算结果未负数时，该标志为1，否则为0。|
+|  DF |  10| 方向标志。该标志为1时，字符串指令每次操作后递减ESI和EDI，为0时递增。|
+|  OF |  11| 溢出标志。有符号数发生溢出时，该标志为1，否则为0。|
+
+```cpp
+//获取被调试进程的主线程的上下文环境。
+BOOL GetDebuggeeContext(CONTEXT* pContext) {
+
+    Wow64SuspendThread(g_hThread);
+    pContext->ContextFlags = CONTEXT_FULL;
+
+    if (GetThreadContext(g_hThread, pContext) == FALSE) {
+        CString strStatusMsg;
+        strStatusMsg.Format(L"GetThreadContext failed");
+        MainDlg->m_wndStatusBar.SetPaneText(0,strStatusMsg);//在状态条上显示文字
+        return FALSE;
+    }
+    ResumeThread(g_hThread);
+    return TRUE;
+}
+```
+　　### 4.跨进程读写内存
+
+　　读取进程的内存使用ReadProcessMemory函数，该函数声明如下：
+```cpp
+BOOL WINAPI ReadProcessMemory(
+     HANDLE hProcess,                  //进程句柄
+     LPCVOID lpBaseAddress,            //要读取的地址
+     LPVOID lpBuffer,                  //一个缓冲区的指针，保存读取到的内容
+     SIZE_T nSize,                     //要读取的字节数
+     SIZE_T* lpNumberOfBytesRead       //一个变量的指针，保存实际读取到的字节数
+ );
+```
+　　要想成功读取到进程的内存，需要两个条件：一是hProcess句柄具有PROCESS_VM_READ的权限；二是由lpBaseAddress和nSize指定的内存范围必须位于用户模式地址空间内，而且是已分配的。
+
+　　对于调试器来说，第一个条件很容易满足，因为调试器对被调试进程具有完整的权限，可以对其进行任意操作。
+
+ 　　第二个条件意味着我们不能读取进程任意地址的内存，而是有一个限制。Windows将进程的虚拟地址空间分成了四个分区，如下表所示：（来自《Windows核心编程（第5版）》）
+ 
+|  分区 |  地址范围 |
+| ------------ | ------------ |
+| 空指针赋值分区  |   0x00000000~0x0000FFFF |
+|  用户模式分区 |  0x00010000~0x7FFEFFFF  |
+|  64KB禁入分区 | 0x7FFF0000~0x7FFFFFFF  |
+|  内核模式分区 |   0x80000000~0xFFFFFFFF|
+
+　　空指针赋值分区主要为了帮助程序员检测对空指针的访问，任何对这一分区的读取或写入操作都会引发异常。64KB禁入分区正如其名字所言，是禁止访问的，由Windows保留。内核模式分区由Windows的内核部分使用，运行于用户态的进程不能访问这一区域。进程只能访问用户模式分区的内存，对于其它分区的访问将会引发ACCESS_VIOLATION异常。
+
+　　另外，并不是用户模式分区的任意部分都可以访问。我们知道，在32位保护模式下，进程的4GB地址空间是虚拟的，在物理内存中不存在。如果要使用某一部分地址空间的话，必须先向操作系统提交申请，让操作系统为这部分地址空间分配物理内存。只有经过分配之后的地址空间才是可访问的，试图访问未分配的地址空间仍然会引发ACCESS_VIOLATION异常。
+
+## 四、关于异常
+　　根据异常发生时是否可以恢复执行，可以将异常分为三种类型，分别是错误异常，陷阱异常以及中止异常。
+
+
+　　错误异常和陷阱异常一般都可以修复，并且在修复后程序可以恢复执行。两者的不同之处在于，错误异常恢复执行时，是从引发异常的那条指令开始执行；而陷阱异常是从引发异常那条指令的下一条指令开始执行。
+
+　　下面来看一下异常的分发过程。为了突出重点，这里省略了很多细节：
+
+　　1.程序发生了一个异常，Windows捕捉到这个异常，并转入内核态执行。
+
+　　2.Windows检查发生异常的程序是否正在被调试，如果是，则发送一个EXCEPTION_DEBUG_EVENT调试事件给调试器，这是调试器第一次收到该事件；如果否，则跳到第4步。
+
+　　3.调试器收到异常调试事件之后，如果在调用ContinueDebugEvent时第三个参数为DBG_CONTINUE，即表示调试器已处理了该异常，程序在发生异常的地方继续执行，异常分发结束；如果第三个参数为DBG_EXCEPTION_NOT_HANDLED，即表示调试器没有处理该异常，跳到第4步。
+
+　　4.Windows转回到用户态中执行，寻找可以处理该异常的异常处理器。如果找到，则进入异常处理器中执行，然后根据执行的结果继续程序的执行，异常分发结束；如果没找到，则跳到第5步。
+
+　　5.Windows又转回内核态中执行，再次检查发生异常的程序是否正在被调试，如果是，则再次发送一个EXCEPTION_DEBUG_EVENT调试事件给调试器，这是调试器第二次收到该事件；如果否，跳到第7步。
+
+　　6.调试器第二次处理该异常，如果调用ContinueDebugEvent时第三个参数为DBG_CONTINUE，程序在发生异常的地方继续执行，异常分发结束；如果第三个参数为DBG_EXCEPTION_NOT_HANDLED，跳到第7步。
+
+　　7.异常没有被处理，程序以“应用程序错误”结束。
+
+ 
+
+　　简单来说就是有调试程序器存在的进程产生异常，会先给调试父进程通知，如果没处理则回到内核寻找(应该是SEH结构)，内核没处理则再次转交给调试父进程，如果还没有处理则结束进程。
+
+ 
+
+　　软件异常：是程序主动触发异常，比如int 3，是陷阱异常，恢复的时候eip会指向指令的下一个
+
+　　硬件异常: 是cpu的异常，比如除0的异常，是错误异常，恢复的时候eip会指向从出错的地方，继续执行。
+
+ 
+
+　　 我们之前在进程创建事件到达之后对于lpStartAddress设置了断点，
+```cpp
+ ...SetCCBreakPointAt((SIZE_T)pInfo->lpStartAddress,TRUE);
+   ... 
+　　 PointInfo newBp;
+    newBp.lpPointAddr = address;
+    newBp.chOldByte = SetBreakPointMemory(newBp.lpPointAddr); //保存原来的字节，用来恢复
+    newBp.isOnlyOne = TRUE;             //一次性断点
+    newBp.nPtNum = g_BpList.size()+1;
+    newBp.ptType = BP_CC;               //CC断点类型
+    g_BpList.push_back(newBp);
+
+//这是自己构造的一个结构体，构造好了之后存入链表当中
+```
+　　当程序断下来之后我们得到异常处理结构体
+```cpp
+typedef struct _EXCEPTION_DEBUG_INFO {
+　　EXCEPTION_RECORD ExceptionRecord;
+　　DWORD dwFirstChance;
+} EXCEPTION_DEBUG_INFO, *LPEXCEPTION_DEBUG_INFO;
+```
+　　dwFirstChance表示是第一次被调试器捕获还是第二次
+　　如果R3调试器第一次捕获了，在ContinueDebugEvent函数传递DBG_EXCEPTION_NOT_HANDLED继续调试，表示这个错误没有处理，让内核异常处理器去处理，内核处理器不干了，就在此把异常给R3调试器，这时dwFirstChance为FALSE，表示是第二次收到异常。
+
+
+　　之前在看的资料是软件断点恢复的地方是 (异常发生的地方的BreakEIP) + 1，所以调试器在处理的时候EIP要 减一，这样就从断开的指令重新开始执行，不然可能指令被破坏(因为一般CC设置在指令的开始)，但是在我调试的时候发现，在处理FirstChance的时候EIP为 BreakEIP + 1，但是在第二次的时候EIP就已经是BreakEIP，所以在第一次异常的时候处理需要EIP-1，第二次异常的时候就不需要EIP-1了，系统已经自动从那个地方执行了。
+```cpp
+//处理断点异常
+BOOL OnSoftBreakPoint(const EXCEPTION_DEBUG_INFO* pInfo) {
+
+    //第一次接收到断点
+    if (pInfo->dwFirstChance == TRUE) {
+
+        //获取断点类型
+        int bpType = GetBreakPointType((DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+
+        if(bpType==BP_CC)
+        {
+            //遍历断点列表，恢复CC
+            RecoverUserBreakPoint((DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+            SaveResetUserBreakPoint((DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+
+            //软件断点，恢复的地方在eip+1的地方，所以要重断点的地方重新执行
+            CONTEXT context;
+            GetDebuggeeContext(&context);
+            --context.Eip;  
+            SetDebuggeeContext(&context);
+        
+
+            //设置TF标志，让CPU执行一步就中断下来
+            SetTrapFlag();
+        }
+    }
+    else {
+
+        //如果第二次处理则不需要EIP--;
+        //RecoverUserBreakPoint((DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+        //SaveResetUserBreakPoint((DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+
+        //第二次的时候已经-1了，不需要
+    
+        //设置TF标志,方便恢复
+        //SetTrapFlag();
+    }
+
+    //如果是代码中的断点或者用户设置的断点，则暂停被调试进程的执行，并通知用户。
+    CString strStatusMsg;
+    strStatusMsg.Format(L"A break point occured at %p",(DWORD)pInfo->ExceptionRecord.ExceptionAddress);
+    MainDlg->m_wndStatusBar.SetPaneText(0,strStatusMsg);//在状态条上显示文字
+    
+    g_alwaysContinue = TRUE;  //用户按Go会执行ContinueDebugEvent，传入DEBUG_CONTINUE
+    g_debuggeeStatus = STATUS_INTERRUPTED;
+    return FALSE; //程序会断下来
+}
+```
+　　寄存器的TF位表示CPU每执行一次就会触发一个EXCEPTION_SINGLE_STEP异常
+
+　　我们把CC断点恢复之后就设置TF位，使程序断下来，这样我们就可以重新设置CC断点(如果是一次性断点就不用恢复了)
+```cpp
+//单步执行异常的处理函数。
+BOOL OnSingleStep(const EXCEPTION_DEBUG_INFO* pInfo) {
+     
+    if(g_resetUserBpAddress != 0)
+    {
+        for (std::list<PointInfo>::iterator it = g_BpList.begin();
+        it != g_BpList.end();
+        ++it) {
+ 
+            if (it->lpPointAddr == g_resetUserBpAddress)
+            {
+                if(it->isOnlyOne==FALSE) //如果不是一次断点则重新设置断点
+                {
+                    SetBreakPointMemory(it->lpPointAddr);   
+                }
+                g_resetUserBpAddress = 0;
+            }
+        }
+    }
+    HandledException(TRUE);
+    return TRUE;   
+}
+```
+　　目前实现的功能是显示汇编代码，在程序入口断下来，显示寄存器，内存。
+
+　　参考
+
+　　[http://www.cnblogs.com/zplutor/archive/2011/03/04/1971279.html](http://www.cnblogs.com/zplutor/archive/2011/03/04/1971279.html)
+
+　　[http://bbs.pediy.com/showthread.php?t=206292](http://bbs.pediy.com/showthread.php?t=206292)
+
+ 　  代码 
+
+　　[http://pan.baidu.com/s/1skFefEH](http://pan.baidu.com/s/1skFefEH) 密码 yzf1

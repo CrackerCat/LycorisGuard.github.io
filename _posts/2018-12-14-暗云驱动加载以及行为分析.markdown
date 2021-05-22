@@ -1,0 +1,125 @@
+---
+layout: post
+title: 暗云Ⅳ驱动加载以及行为分析
+date: 2018-12-14 20:31:12 +0900
+category: Analyse
+---
+## 0x01 前言
+
+　　暗云Ⅳ的隐藏技术真的厉害，通过调试暗云Ⅳ，可以提高调试技巧，也能熟悉MBR相关知识。
+
+　　内核分析部分参考 火绒的 [“隐匿者”病毒团伙技术升级传播病毒 暴力入侵电脑威胁全网用户](https://mp.weixin.qq.com/s/0hmF_97UcVZAzwm4NlBrDA)
+
+## 0x02 环三感染MBR
+
+#### 1. 获取系统所在磁盘的DeviceNumber
+
+　　通过打开逻辑盘符\\\\.\\%c，这里格式化的是系统盘符, 通过GetSystemDirectory获得. 
+
+　　向\\\\.\\%c链接的磁盘发送IOCTL_STORAGE_GET_DEVICE_NUMBER获取磁盘的DeviceNumber。
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/1.png)
+
+#### 2. 格式化\\\\.\\PhysicalDrive%d，这里将DeviceNumber格式化
+
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/2.png)
+
+#### 3.保存原来的Boot分区
+
+　　打开\\\\.\\PhysicalDrive0后，读取0x400的内容，判断是否为GPT分区，如果是则不支持。判断是否已经写过Mbr，写过则退出。判断是否有其他软件写了Mbr，会进行覆盖，这里我们展开。
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/3.png)
+
+#### 4. 重写MBR，写入驱动shellcode
+
+　　首先将MBR改写
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/4.png)
+
+　　改写后的MBR为：
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/5.png)
+
+　　之后将内核shellcode从dat文件中写入2-53扇区，在下次开机时刻进行执行。
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/6.png)
+
+## 0x03 调试内核
+
+#### 1.使用IDA调试MBR
+
+　　设置虚拟机的VMX文件
+
+```cpp
+debugStub.listen.guest32 = "TRUE"
+debugStub.hideBreakpoints = "TRUE"
+bios.bootDelay = "3000"
+```
+
+　　打开IDA--Debugger--Attach--Remote GDB debugger
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/7.png)
+
+　　Hostname为localhost，port为8832
+
+　　启动虚拟机后点击上面窗口OK按钮，弹出选择附加进程，选择第一个，点OK
+
+![8](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/8.png)
+
+　　在MBR载入内存的地方下断，也就是断在0x7c00
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/9.png)
+
+　　F9运行起来，停在0x7C00的地方
+
+![10](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/10.png)
+
+　　这个时候最好Alt+s下，选择16位的模式，因为这个时候还未进入32位模式
+
+![11](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/11.png)
+
+![12](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/12.png)
+
+　　现在我们就可以开始调试了。
+
+ 
+
+#### 2.我们可以查看环三程序中写入mbr的代码，这个时候由于是mbr代码，是16位模式，我们修改到16bit后，可以看到代码
+
+![13](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/13.png)
+
+　　可以对照着调试的代码看
+
+![14](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/14.png)
+
+　　Hook ZwCreateSection, 获得内核的执行权. 
+
+　　开机过程中可以对ZwCreateSection下断点, 跟踪暗云Ⅳ驱动的感染过程.
+
+![15](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/15.png)
+
+#### 3.线程回调, 等待csrss进程启动
+
+　　x64
+```cpp
+.for(r $t0=0;$t0<0x40;r $t0 = $t0+1){r $t1=poi($t0*8+nt!PspCreateThreadNotifyRoutine);.if($t1==0){.continue};r $t1=$t1&0xFFFFFFFFFFFFFFF0;r $t1=poi($t1+8);r $t1;u $t1;ln $t1;}
+```
+　　x86
+```cpp
+.for(r $t0=0;$t0<0x40;r $t0 = $t0+1){r $t1=poi($t0*4+nt!PspCreateThreadNotifyRoutine);.if($t1==0){.continue};r $t1=$t1&0xFFFFFFF8;r $t1=poi($t1+4);r $t1;u $t1;ln $t1;}
+```
+
+　　使用上面的windbg脚本，可以看到暗云Ⅳ驱动注册的PspCreateThreadNotify函数, 同时看到暗云Ⅳ驱动申请的shellcode内存大小为0x20000, 起始地址为fffffa8003dd5000. 而PspCreateThreadNotify偏移为0x5824
+
+![16](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/16.png)
+
+#### 3.对该shellcode+0x5035下断点，进入Hook Disk的逻辑
+
+![17](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2018-12-14/17.png)
+
+　　对该shellcode+0x5035下断点，进入Hook Disk的逻辑，在调试win7上对不同磁盘类型实现上，我们在shellcode+0x521c下断点，针对miniport为atapi/msahci是一类处理方式，针对miniport是storahci是一类处理方式，不是上述的则为另一类，win7上共三种Hook方式。
+
+
+　　参考：
+
+　　[IDA&&BOCHS调试MBR](https://www.52pojie.cn/thread-173889-1-1.html)

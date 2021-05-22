@@ -1,0 +1,374 @@
+---
+layout: post
+title: Windows x64 栈帧结构 
+date: 2016-08-07 14:51:12 +0900
+category: windows
+---
+## 0x01 前言
+
+　　Windows 64位下函数调用约定变为了快速调用约定，前4个参数采用rcx、rdx、r8、r9传递，多余的参数从右向左依次使用堆栈传递。本次文章是对于Windows 64位下函数调用的分析，分析各种参数情况下调用者和被调用函数的栈结构。
+
+## 0x02 4参数时函数调用流程
+
+   64位下函数的调用约定全部用FASTCALL，就是前4个参数依次用rcx,rdx,r8,r9传递，多余的参数从右至左压参。
+
+### 1)测试用例
+
+　　我们先用c语言写一个调用4参数的函数　
+```cpp
+int Add(int a,int b,int c,int d);
+
+int _tmain(int argc, _TCHAR* argv[])
+{
+    int a = 0;
+    Add(1,2,3,4);
+    return 0;
+}
+
+int Add(int a,int b,int c,int d)
+{
+    int xx = a+b+c+d;
+    int yy = a+b-c-d;
+    int zz = -a-b+c+d;
+    return xx;
+}
+```
+
+### 2)分析过程　　
+
+　　使用Vs2010 ，64位下调试，打开寄存器窗口，Alt+8 反汇编
+
+　　①Main中调用Add函数
+```cpp
+000000013F931049  mov         r9d,4  
+000000013F93104F  mov         r8d,3  
+000000013F931055  mov         edx,2  
+000000013F93105A  mov         ecx,1  
+000000013F93105F  call        Add (13F931005h)   ;指令为 push rip    ;RSP-8   
+                                                 ;       jmp Add
+```
+　　可以看到首先将1,2,3,4放在寄存器中，然后调用call指令，call指令可以分解为将下一条指令压参，然后jmp到函数地址,注意在执行push指令的时候，RSP-8
+
+　　
+
+　　②Add函数
+```cpp
+int Add(int a,int b,int c,int d)
+{
+000000013F251080  mov         dword ptr [rsp+20h],r9d  
+000000013F251085  mov         dword ptr [rsp+18h],r8d  
+000000013F25108A  mov         dword ptr [rsp+10h],edx  
+000000013F25108E  mov         dword ptr [rsp+8],ecx  
+000000013F251092  push        rdi                ;保存前栈底   RSP-8
+000000013F251093  sub         rsp,10h            ;开辟栈区 16字节 RSP-10h
+000000013F251097  mov         rdi,rsp            ;新栈帧栈底rdi=rsp
+000000013F25109A  mov         ecx,4              ;循环次数
+000000013F25109F  mov         eax,0CCCCCCCCh  
+000000013F2510A4  rep stos    dword ptr [rdi]    ;将rdi开始赋值eax中的值，循环4次
+000000013F2510A6  mov         ecx,dword ptr [rsp+20h]  ;此处是第一个参数a  
+    int xx = a+b+c+d;
+000000013F2510AA  mov         eax,dword ptr [b]  
+000000013F2510AE  mov         ecx,dword ptr [a]  
+000000013F2510B2  add         ecx,eax  
+000000013F2510B4  mov         eax,ecx  
+000000013F2510B6  add         eax,dword ptr [c]  
+000000013F2510BA  add         eax,dword ptr [d]  
+000000013F2510BE  mov         dword ptr [rsp],eax  ;rsp 保存 xx
+    int yy = a+b-c-d;
+000000013F2510C1  mov         eax,dword ptr [b]  
+000000013F2510C5  mov         ecx,dword ptr [a]  
+000000013F2510C9  add         ecx,eax  
+000000013F2510CB  mov         eax,ecx  
+000000013F2510CD  sub         eax,dword ptr [c]  
+000000013F2510D1  sub         eax,dword ptr [d]  
+000000013F2510D5  mov         dword ptr [yy],eax   ;rsp+4 保存yy
+    int zz = -a-b+c+d;
+000000013F2510D9  mov         eax,dword ptr [a]  
+000000013F2510DD  neg         eax  
+000000013F2510DF  sub         eax,dword ptr [b]  
+000000013F2510E3  add         eax,dword ptr [c]  
+000000013F2510E7  add         eax,dword ptr [d]  
+000000013F2510EB  mov         dword ptr [zz],eax  //rsp+8 保存
+    return xx;
+000000013F2510EF  mov         eax,dword ptr [rsp]  ;将返回值保存在eax寄存器中
+}
+000000013F2510F2  add         rsp,10h    ;恢复开辟的栈区
+000000013F2510F6  pop         rdi        ;恢复前栈帧的栈底
+000000013F2510F7  ret                    ;pop rip  将之前保存的call下一条指令弹出给rip ， 继续执行 
+                                         ;RSP - 8  等于调用call之前的值 
+```
+
+　　可以看到前4句将寄存器中传递的参数赋值给rsp+8h,rsp+10h,rsp+18h，rsp+20h，这是因为虽然使用寄存器传参，但是在栈区函数还是会开辟0x20大小的区域保存传递过来的参数，不过使用寄存器传参会比使用堆栈传参更有效率。
+
+　　push rdi;保存前栈帧栈底
+
+　　sub rsp,10h;开辟栈区保存局部变量，由于是三个变量12字节，对齐内存是16字节，sub rsp,10h
+
+　　mov rdi,rsp;保存当前函数栈的栈底
+
+　　mov ecx,4
+
+　　mov eax,0CCCCCCCCh 
+
+　　rep stos dword ptr [rdi]    这三句是将rdi(栈底)指向的值，循环4次(rcx)，赋值为0CCCCCCCCh(eax)，这里是初始化栈区开辟的0x10字节的内容，注意release和debug版本的变化，debug版本会自动将变量初始化为0CCCCCCCCh，但是release版本不会初始化，如果忘记初始化则会编译报错。
+
+　　函数最后返回参数需要保存在eax中，add　　rsp,10h要将之前堆栈开辟的栈区恢复，pop　　rdi;要将之前push的main函数栈底恢复到rdi中。ret指令相当于pop rip，将call时压入的rip(call的下一条指令)恢复，这样一次函数调用的流程便结束了。
+
+ 
+
+### 3)内存分析
+
+　　①我们查看main函数的栈底RDI和栈顶RSP
+
+![1](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/1.png)
+
+　　②保存上一个函数栈底，将rsp赋值给rdi，作为新函数Add()函数的栈底
+ 
+![2](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/2.png)
+
+　　此时RSP经过 call 中的push rip 减去8，push edi 减去8，sub rsp,10h 一共减去20h，rsp赋值给rdi，为当前Add的栈底
+
+![3](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/3.png)
+
+　　rdi经过rep stos 指令将eax中值初始化到rdi中，共4*4字节，rdi初始化之后加10h,此时我们看内存中的情况如上图所示
+
+　　栈帧情况如下
+
+![4](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/4.png)
+
+## 0x03 5参数时函数调用流程以及调用者栈分析
+
+　　我们在试试5参数的函数调用情况，同时我们知道函数会把4个寄存器中的值赋值到栈上面的区域，要开辟4*8=0x20h的区域，在调试的时候没有发现对于rsp的操作，于是猜测是在上一个函数中已经开辟好了额外的空间存储参数的数据。
+
+### 1）测试用例
+
+　　我们在main中调用5参数的Sub()函数查看5参数调用流程
+
+　　同时在Sub()中调用Add()函数，查看调用者栈的使用情况
+
+```cpp
+#include "stdafx.h"
+int Sub(int a,int b,int c,int d,int e);
+int _tmain(int argc, _TCHAR* argv[])
+{
+    int a = 0;
+    Sub(1,2,3,4,5);
+    return 0;
+}
+
+int Add(int a,int b,int c,int d,int e)
+{
+    int xx = a+b+c+d;
+    int yy = a+b-c-d;
+    int zz = -a-b+c+d;
+    return xx;
+}
+
+int Sub(int a,int b,int c,int d,int e)
+{
+    int xx = a+b+e+d;
+    int yy = a+b-c-d;
+    int zz = -a-b+c+d;
+    Add(b,c,d,e,xx);
+    return xx;
+}
+```
+
+### 2)分析过程
+
+　　①main函数中调用5参数函数
+```cpp
+    Sub(1,2,3,4,5);
+000000013F4F2EF9  mov         dword ptr [rsp+20h],5   ;当前rsp + 20 就是存储4个参数之后的位置  
+000000013F4F2F01  mov         r9d,4  
+000000013F4F2F07  mov         r8d,3  
+000000013F4F2F0D  mov         edx,2  
+000000013F4F2F12  mov         ecx,1  
+000000013F4F2F17  call        Sub (13F4F100Fh)
+```
+
+　　这里多余的一个参数直接保存在rsp+20h的地址中，使用栈传递参数，我们下面在调用者的栈分析中会说明rsp+20h是什么
+
+　　
+
+　　②Sub()函数作为调用者，调用Add()函数的过程分析
+
+```cpp
+int Sub(int a,int b,int c,int d,int e)
+{
+000000013F211110  mov         dword ptr [rsp+20h],r9d  ;第四个参数  此时的rsp为上一个函数的rsp
+000000013F211115  mov         dword ptr [rsp+18h],r8d  ;第三个参数
+000000013F21111A  mov         dword ptr [rsp+10h],edx  ;第二个参数
+000000013F21111E  mov         dword ptr [rsp+8],ecx  ;第一个参数
+000000013F211122  push        rdi  ;保存main函数栈底
+000000013F211123  sub         rsp,40h  ;开辟本函数栈区，这里是三个局部变量对齐为0x10，和下一个函数的0x20+0x8。全部对齐为0x40
+000000013F211127  mov         rdi,rsp  ;保存本函数栈底
+000000013F21112A  mov         ecx,10h  ;rep次数
+000000013F21112F  mov         eax,0CCCCCCCCh  ;rep初始化值
+000000013F211134  rep stos    dword ptr [rdi]  ;初始化本函数栈区
+000000013F211136  mov         ecx,dword ptr [rsp+50h]  
+    int xx = a+b+e+d;
+000000013F21113A  mov         eax,dword ptr [b]  
+000000013F21113E  mov         ecx,dword ptr [a]  
+000000013F211142  add         ecx,eax  
+000000013F211144  mov         eax,ecx  
+000000013F211146  add         eax,dword ptr [e]  
+000000013F21114A  add         eax,dword ptr [d]  
+000000013F21114E  mov         dword ptr [xx],eax  ;xx=a+b+c+d 值为10
+    int yy = a+b-c-d;
+000000013F211152  mov         eax,dword ptr [b]  
+000000013F211156  mov         ecx,dword ptr [a]  
+000000013F21115A  add         ecx,eax  
+000000013F21115C  mov         eax,ecx  
+000000013F21115E  sub         eax,dword ptr [c]  
+000000013F211162  sub         eax,dword ptr [d]  
+000000013F211166  mov         dword ptr [yy],eax  ;yy=a+b-c-d 值为-4
+    int zz = -a-b+c+d;
+000000013F21116A  mov         eax,dword ptr [a]  
+000000013F21116E  neg         eax  
+000000013F211170  sub         eax,dword ptr [b]  
+000000013F211174  add         eax,dword ptr [c]  
+000000013F211178  add         eax,dword ptr [d]  
+000000013F21117C  mov         dword ptr [zz],eax  ;zz=-a-b+c+d 值为4
+    Add(b,c,d,e,xx);
+000000013F211180  mov         eax,dword ptr [xx]  
+000000013F211184  mov         dword ptr [rsp+20h],eax  ;第五个参数  保存在Sub函数的rsp+20h处
+000000013F211188  mov         r9d,dword ptr [e]  ;第四个参数
+000000013F21118D  mov         r8d,dword ptr [d]  ;第三个参数
+000000013F211192  mov         edx,dword ptr [c]  ;第二个参数
+000000013F211196  mov         ecx,dword ptr [b]  ;第一个参数
+000000013F21119A  call        Add (13F211005h)  
+    return xx;
+000000013F21119F  mov         eax,dword ptr [xx]  
+}
+```
+
+　　我在函数中调用了Add()函数，结果rsp - 0x40 开辟了0x40大小的栈区空间，这里的0x10是保存三个int型的局部变量，0x30中保存Add的4个寄存器中的值使用了0x20，还有0x08用作保存第5个参数，剩下的用于内存对齐。
+
+ 
+
+### 3)内存分析
+
+　　①我们在Sub函数的栈顶RSP初始化完成之后，查看RSP的值
+
+![5](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/5.png)
+
+　　②在内存中输入RSP地址，查看栈区内存，当我们对局部变量xx,yy,zz赋值完成之后栈区如下图所示
+
+![6](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/6.png)
+
+　　可以看出Sub函数栈中，栈顶RSP+0x30、0x34、0x38分别保存着局部变量xx/yy/zz，+0x3c的地方有4字节用于内存对齐。
+
+ 　  
+
+　　③我们再看看Sub()函数中调用Add()函数返回之后Sub函数栈的内容
+
+![7](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/7.png)
+
+　　此时在Add()函数返回之后，Add()开辟的函数栈已经销毁，但是Sub()函数依然保留这传递给Add()的参数，从RSP开始依次0x20内存区域保存4个寄存器传递的参数的值，2，3，4，5。在RSP+0x20的地方保存了第五个参数的值0xc，这里就是在调用的时候直接使用RSP+20的原因，这里的赋值是在Add()函数开始将4个寄存器中的值拷贝到这里的，可以参考Sub()函数开始将寄存器中值拷贝到main函数栈区。
+
+## 0x04 少于4参数时函数调用流程
+
+### 1）我们编写c语言测试三参数函数调用
+
+```cpp
+#include "stdafx.h"
+int Sub(int a,int b,int c);
+int _tmain(int argc, _TCHAR* argv[])
+{
+    int a = 0;
+    Sub(1,2,3);
+    return 0;
+}
+
+int Add(int a,int b,int c)//2,3,3
+{
+    int xx = a+b+c;
+    int yy = a+b-c;
+    int zz = -a-b+c;
+    return xx;
+}
+
+int Sub(int a,int b,int c)//1,2,3
+{
+    int xx = a+b;//3
+    int yy = a+b-c;//0
+    int zz = -b+c;//1
+    Add(b,c,xx);//2,3,3
+    return xx;
+}
+```
+### 2)分析过程
+
+　　我们直接查看Sub()函数的汇编代码
+```cpp
+int Sub(int a,int b,int c)//1,2,3
+{
+000000013F8E10F0  mov         dword ptr [rsp+18h],r8d  ;r9寄存器没有用到
+000000013F8E10F5  mov         dword ptr [rsp+10h],edx  
+000000013F8E10F9  mov         dword ptr [rsp+8],ecx  
+000000013F8E10FD  push        rdi  
+000000013F8E10FE  sub         rsp,30h  ;开辟了0x10用于局部变量，0x20用于Add()函数的参数
+000000013F8E1102  mov         rdi,rsp  
+000000013F8E1105  mov         ecx,0Ch  
+000000013F8E110A  mov         eax,0CCCCCCCCh  
+000000013F8E110F  rep stos    dword ptr [rdi]  
+000000013F8E1111  mov         ecx,dword ptr [rsp+40h]  
+    int xx = a+b;//3
+000000013F8E1115  mov         eax,dword ptr [b]  
+000000013F8E1119  mov         ecx,dword ptr [a]  
+000000013F8E111D  add         ecx,eax  
+000000013F8E111F  mov         eax,ecx  
+000000013F8E1121  mov         dword ptr [xx],eax  ;xx = a+b 3
+    int yy = a+b-c;//0
+000000013F8E1125  mov         eax,dword ptr [b]  
+000000013F8E1129  mov         ecx,dword ptr [a]  
+000000013F8E112D  add         ecx,eax  
+000000013F8E112F  mov         eax,ecx  
+000000013F8E1131  sub         eax,dword ptr [c]  
+000000013F8E1135  mov         dword ptr [yy],eax  ;yy = a+b-c 0
+    int zz = -b+c;//1
+000000013F8E1139  mov         eax,dword ptr [b]  
+000000013F8E113D  neg         eax  
+000000013F8E113F  add         eax,dword ptr [c]  
+000000013F8E1143  mov         dword ptr [zz],eax  ;zz = -b+c 1
+    Add(b,c,xx);//2,3,3
+000000013F8E1147  mov         r8d,dword ptr [xx]  ;第三参数
+000000013F8E114C  mov         edx,dword ptr [c]  ;第二参数
+000000013F8E1150  mov         ecx,dword ptr [b]  ;第一参数
+000000013F8E1154  call        Add (13F8E1014h)  
+    return xx;
+000000013F8E1159  mov         eax,dword ptr [xx]  
+}
+```
+
+　　我在函数中调用了Add()函数，结果rsp - 0x30 开辟了0x30大小的栈区空间，这里有0x10是保存三个int型的局部变量，可以看到虽然只是用了三个寄存器传递参数，但是Sub()函数依然开辟了0x20保存4个参数的栈内存。
+
+ 
+
+### 3)内存分析
+
+　　①我们在Sub()函数初始化RSP完成之后，查看RSP的值
+
+![9](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/8.png)
+
+　　②通过Sub()函数的RSP，我们查看Add()调用之后的Sub()函数栈区内存
+
+![10](https://raw.githubusercontent.com/LycorisGuard/BlogPic/master/2016-08-07/9.png)
+
+ 　　这里RSP依次保存三个参数，第四个参数内存初始化为cccccccch，然后就是Sub函数自身的局部变量，最后4个字节为内存对齐的开销。
+ 
+ ## 0x05 总结
+　　本文编写了几个小Demo，验证了64位下函数调用时栈的分配情况。
+
+　　1.函数在开始会将寄存器上的参数拷贝到栈中保存，这块内存由调用函数开辟
+
+　　2.少于或等于4参数情况，调用者函数会分配多余0x20字节内存用于保存调用函数的参数，保存由寄存器传递的参数。
+
+　　3.多余4参数时，调用者函数会分配0x20+多余参数个数 x 8 字节的内存用于保存调用函数的参数。其中0x20保存寄存器赋值的参数，多余的通过栈传递。
+
+　　4.函数的call指令，会保存下一条指令入栈，接着跳转到函数的开头。
+
+　　5.ret指令，会弹出之前保存的call之后的指令到eip/rip上，返回执行call之后的内容。
+
+　　6.函数栈是连续的，函数在开始会保存上一个函数栈帧，在结束时还原上一个函数栈帧。

@@ -1,0 +1,9 @@
+---
+layout: post
+title: 开始用github记录blog
+date: 2016-01-03 08:52:53 +0900
+category: ReadMe
+---
+## 记录新学习到的知识！
+
+### 原始blog地址[https://www.cnblogs.com/aliflycoris/](https://www.cnblogs.com/aliflycoris/)后续不在更新, 后续将学习记录在[https://lycorisguard.github.io/](https://lycorisguard.github.io/)上
