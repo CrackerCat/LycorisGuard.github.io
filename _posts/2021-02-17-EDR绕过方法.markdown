@@ -1,7 +1,7 @@
 ---
 layout: post
-title: 初识Go逆向
-date: 2020-12-10 14:20:12 +0900
+title: EDR绕过方法
+date: 2021-02-17 22:41:12 +0900
 category: AntiEDR
 ---
 ### 0x01 前言
